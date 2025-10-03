@@ -24,6 +24,8 @@ class TsWriter(
     private var ccVideo = 0
     private var ccAudio = 0
 
+    private fun usTo90k(us: Long): Long = (us * 9L) / 100L
+
     // ------------------------------------------------------------
     // TS packet (adaptation/PCR/stuffing)
     // ------------------------------------------------------------
@@ -426,7 +428,7 @@ class TsWriter(
             System.arraycopy(header, 0, it, 0, header.size)
             System.arraycopy(payload, 0, it, header.size, payload.size)
         }
-        splitToTs(VIDEO_PID, ptsUs, pes, 0, pes.size, true)
+        splitToTs(VIDEO_PID, usTo90k(ptsUs), pes, 0, pes.size, true)
     }
 
     fun writeAudioFrame(aacEncoderOutput: ByteArray, ptsUs: Long, sampleRate: Int, channels: Int) {
