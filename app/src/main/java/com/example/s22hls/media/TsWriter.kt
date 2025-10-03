@@ -15,8 +15,8 @@ class TsWriter(
         const val PMT_PID = 0x1000
         const val VIDEO_PID = 0x0101
         const val AUDIO_PID = 0x0102
-        const val STREAM_TYPE_HEVC = 0x24
-        const val STREAM_TYPE_AAC = 0x0F
+        const val STREAM_TYPE_HEVC = 0x24   // use 0x1B para H.264/AVC
+        const val STREAM_TYPE_AAC  = 0x0F
     }
 
     private var ccPat = 0
@@ -25,7 +25,7 @@ class TsWriter(
     private var ccAudio = 0
 
     // ------------------------------------------------------------
-    // TS packet
+    // TS packet (com stuffing/adaptation field correto)
     // ------------------------------------------------------------
     private fun writePacket(
         pid: Int,
@@ -37,44 +37,49 @@ class TsWriter(
     ): Int {
         var off = offset
         var len = length
+
         val buf = ByteArray(TS_PACKET_SIZE)
         buf[0] = SYNC_BYTE.toByte()
-        val pus = if (payloadUnitStart) 0x40 else 0x00
-        buf[1] = ((if (pid >= 0x100) 0x40 else 0x00) or pus or ((pid shr 8) and 0x1F)).toByte()
-        buf[2] = (pid and 0xFF).toByte()
 
-        var afc = 1 // payload only
-        val ccRef = when (pid) {
-            PAT_PID -> ccPat
-            PMT_PID -> ccPmt
-            VIDEO_PID -> ccVideo
-            else -> ccAudio
-        }
+        val tei = 0
+        val pusi = if (payloadUnitStart) 0x40 else 0x00
+        val tp = 0
+        buf[1] = (tei or pusi or tp or ((pid shr 8) and 0x1F)).toByte()  // high 5 bits do PID
+        buf[2] = (pid and 0xFF).toByte()                                 // low 8 bits do PID
 
-        val headerLen = 4
-        var adaptionLen = 0
+        // Decidimos se haverá adaptation field: PCR ou stuffing quando payload < 184
+        val needPcr = (pcrBase != null) && (pid == pcrPid)
+        val minimalPayloadAvail = 184 - (if (needPcr) 1 + 6 else 0) // 1(flags) + 6(PCR)
+        val willNeedStuffing = len < minimalPayloadAvail
+
+        val hasAdaptation = needPcr || willNeedStuffing
         var p = 4
-        if (pcrBase != null && pid == pcrPid) {
-            afc = 3 // adaptation + payload
-        }
-        buf[3] = ((afc shl 4) or (ccRef and 0x0F)).toByte()
+        var afFlags = 0
+        var pcrLen = 0
+        var stuffing = 0
 
-        if ((afc and 0x2) != 0) {
-            buf[p++] = 0 // adaptation_field_length (placeholder)
-            var flags = 0
-            val pcrLen = if (pcrBase != null) 6 else 0
-            adaptionLen = 1 + pcrLen
+        if (hasAdaptation) {
+            if (needPcr) { afFlags = afFlags or 0x10; pcrLen = 6 }
+            // cálculo de stuffing: após header(4) + 1(len) + 1(flags) + pcr(0/6),
+            // payload disponível = 188 - (4 + 1 + 1 + pcrLen)
+            val availAfterAF = 188 - (4 + 1 + 1 + pcrLen)
+            stuffing = if (len < availAfterAF) (availAfterAF - len) else 0
 
-            val stuffing = TS_PACKET_SIZE - headerLen - adaptionLen - len
-            val stuff = if (stuffing < 0) 0 else stuffing
-            adaptionLen += stuff
+            buf[3] = ((0x2 or 0x1) shl 4 or (when (pid) {
+                PAT_PID -> ccPat
+                PMT_PID -> ccPmt
+                VIDEO_PID -> ccVideo
+                else -> ccAudio
+            } and 0x0F)).toByte() // afc=3 (AF + payload)
 
-            buf[4] = (adaptionLen - 1).toByte()
-            if (pcrBase != null) flags = flags or 0x10
-            buf[5] = flags.toByte()
+            // adaptation_field_length = flags(1) + PCR(0/6) + stuffing
+            val afLen = 1 + pcrLen + stuffing
+            buf[4] = afLen.toByte()
+            buf[5] = afFlags.toByte()
             var q = 6
-            if (pcrBase != null) {
-                val pcr = pcrBase * 300
+
+            if (needPcr) {
+                val pcr = pcrBase!! * 300
                 buf[q++] = ((pcr shr 25) and 0xFF).toByte()
                 buf[q++] = ((pcr shr 17) and 0xFF).toByte()
                 buf[q++] = ((pcr shr 9) and 0xFF).toByte()
@@ -82,12 +87,20 @@ class TsWriter(
                 buf[q++] = (((pcr and 0x1) shl 7) or 0x7E).toByte()
                 buf[q++] = 0x00
             }
-            while (q < 4 + adaptionLen) buf[q++] = 0xFF.toByte()
-            p = 4 + adaptionLen
+            repeat(stuffing) { buf[q++] = 0xFF.toByte() }
+
+            p = 4 + 1 + afLen // header(4) + length + afLen
+        } else {
+            buf[3] = ((0x1 shl 4) or (when (pid) {
+                PAT_PID -> ccPat
+                PMT_PID -> ccPmt
+                VIDEO_PID -> ccVideo
+                else -> ccAudio
+            } and 0x0F)).toByte() // afc=1 (somente payload)
         }
 
-        val avail = TS_PACKET_SIZE - p
-        val n = min(avail, len)
+        val availPayload = 188 - p
+        val n = min(availPayload, len)
         System.arraycopy(data, off, buf, p, n)
         out.write(buf)
 
@@ -101,9 +114,11 @@ class TsWriter(
     }
 
     private fun writePsi(pid: Int, table: ByteArray) {
+        // pointer_field + seção
         val payload = ByteArray(1 + table.size)
-        payload[0] = 0 // pointer_field
+        payload[0] = 0 // pointer_field = 0
         System.arraycopy(table, 0, payload, 1, table.size)
+
         var off = 0
         var pusi = true
         while (off < payload.size) {
@@ -115,83 +130,100 @@ class TsWriter(
     }
 
     // ------------------------------------------------------------
-    // PSI
+    // PSI (PAT/PMT) com section_length correto
     // ------------------------------------------------------------
     private fun crc32(bytes: ByteArray): Int {
-        var crc = -0x1
+        var crc = -1
         for (b in bytes) {
             val c = (b.toInt() xor ((crc ushr 24) and 0xFF)) and 0xFF
             var r = c shl 24
-            repeat(8) {
-                r = if ((r and 0x80000000.toInt()) != 0) (r shl 1) xor 0x04C11DB7 else r shl 1
-            }
+            repeat(8) { r = if ((r and 0x8000_0000.toInt()) != 0) (r shl 1) xor 0x04C11DB7 else r shl 1 }
             crc = (crc shl 8) xor r
         }
         return crc
     }
 
     private fun buildPAT(): ByteArray {
-    val sec = ByteArray(13)
-    sec[0] = 0x00
-    sec[1] = 0xB0.toByte()
-    sec[2] = 0x0D
-    sec[3] = 0x00; sec[4] = 0x01
-    sec[5] = 0xC1.toByte()
-    sec[6] = 0x00; sec[7] = 0x00
-    // ANTES: fixo 0xE1,0x00 (PID 0x0100) -> ERRADO
-    // AGORA: usa PMT_PID corretamente (13 bits: '111' + high 5 bits, depois low 8 bits)
-    sec[8]  = (0xE0 or ((PMT_PID shr 8) and 0x1F)).toByte()
-    sec[9]  = (PMT_PID and 0xFF).toByte()
-    val crc = crc32(sec.copyOfRange(0, 12))
-    sec[12] = ((crc ushr 24) and 0xFF).toByte()
-    val rest = byteArrayOf(((crc ushr 16) and 0xFF).toByte(), ((crc ushr 8) and 0xFF).toByte(), (crc and 0xFF).toByte())
-    return sec + rest
-}
+        val sec = ByteArrayOutputStream()
+        fun w(v: Int) = sec.write(v and 0xFF)
 
-    // --- buildPMT(): CORRIGIR PCR PID e elementary_PID de cada ES ---
-private fun buildPMT(): ByteArray {
-    fun esEntry(streamType: Int, pid: Int): ByteArray {
-        return byteArrayOf(
-            streamType.toByte(),
-            (0xE0 or ((pid shr 8) and 0x1F)).toByte(), // high 5 bits do PID (com '111' prefixados)
-            (pid and 0xFF).toByte(),                   // low 8 bits
-            0xF0.toByte(), 0x00                        // ES_info_length = 0
-        )
+        w(0x00) // table_id
+        w(0xB0); w(0x00) // section_syntax_indicator(1), '0'(1), reserved(2), section_length(12) [placeholder]
+
+        w(0x00); w(0x01) // transport_stream_id
+        w(0xC1)          // version_number(5=0), current_next=1
+        w(0x00)          // section_number
+        w(0x00)          // last_section_number
+
+        // program_number=1 -> PMT_PID
+        w(0x00); w(0x01)
+        w(0xE0 or ((PMT_PID shr 8) and 0x1F))
+        w(PMT_PID and 0xFF)
+
+        val bytesNoCrc = sec.toByteArray()
+        val sectionLen = bytesNoCrc.size - 3 + 4 // from after table_id to end incl CRC
+        bytesNoCrc[1] = (0xB0 or ((sectionLen shr 8) and 0x0F)).toByte()
+        bytesNoCrc[2] = (sectionLen and 0xFF).toByte()
+
+        val crc = crc32(bytesNoCrc)
+        val out = ByteArray(bytesNoCrc.size + 4)
+        System.arraycopy(bytesNoCrc, 0, out, 0, bytesNoCrc.size)
+        out[out.size - 4] = ((crc ushr 24) and 0xFF).toByte()
+        out[out.size - 3] = ((crc ushr 16) and 0xFF).toByte()
+        out[out.size - 2] = ((crc ushr 8) and 0xFF).toByte()
+        out[out.size - 1] = (crc and 0xFF).toByte()
+        return out
     }
 
-    val esVideo = esEntry(STREAM_TYPE_HEVC, VIDEO_PID)   // use STREAM_TYPE_H264 (0x1B) se mudar para AVC
-    val esAudio = esEntry(STREAM_TYPE_AAC,  AUDIO_PID)
+    private fun buildPMT(): ByteArray {
+        fun esEntry(streamType: Int, pid: Int): ByteArray {
+            return byteArrayOf(
+                streamType.toByte(),
+                (0xE0 or ((pid shr 8) and 0x1F)).toByte(),
+                (pid and 0xFF).toByte(),
+                0xF0.toByte(), 0x00  // ES_info_length=0
+            )
+        }
 
-    val sec = ByteArray(1024)
-    var i = 0
-    sec[i++] = 0x02
-    sec[i++] = 0xB0.toByte(); sec[i++] = 0 // placeholder section_length
-    sec[i++] = 0x00; sec[i++] = 0x01
-    sec[i++] = 0xC1.toByte()
-    sec[i++] = 0x00; sec[i++] = 0x00
-    // PCR PID = VIDEO_PID (13 bits)
-    sec[i++] = (0xE0 or ((VIDEO_PID shr 8) and 0x1F)).toByte()
-    sec[i++] = (VIDEO_PID and 0xFF).toByte()
-    // program_info_length = 0
-    sec[i++] = 0xF0.toByte(); sec[i++] = 0x00
-    // ES entries
-    for (b in esVideo) sec[i++] = b
-    for (b in esAudio) sec[i++] = b
+        val esVideo = esEntry(STREAM_TYPE_HEVC, VIDEO_PID)
+        val esAudio = esEntry(STREAM_TYPE_AAC,  AUDIO_PID)
 
-    // section_length (12 bits) = (i - 3) + 4 (CRC)
-    val slen = i - 3 + 4
-    // high 4 bits de section_length entram nos 4 bits baixos de sec[1]
-    sec[1] = (0xB0 or ((slen shr 8) and 0x0F)).toByte()
-    sec[2] = (slen and 0xFF).toByte()
+        val sec = ByteArrayOutputStream()
+        fun w(v: Int) = sec.write(v and 0xFF)
 
-    val crc = crc32(sec.copyOfRange(0, i))
-    sec[i++] = ((crc ushr 24) and 0xFF).toByte()
-    sec[i++] = ((crc ushr 16) and 0xFF).toByte()
-    sec[i++] = ((crc ushr 8) and 0xFF).toByte()
-    sec[i++] = (crc and 0xFF).toByte()
-    return sec.copyOfRange(0, i)
-}
+        w(0x02) // table_id
+        w(0xB0); w(0x00) // section_length placeholder
 
+        w(0x00); w(0x01) // program_number
+        w(0xC1)          // version/current_next
+        w(0x00)          // section_number
+        w(0x00)          // last_section_number
+
+        // PCR PID (vídeo)
+        w(0xE0 or ((VIDEO_PID shr 8) and 0x1F))
+        w(VIDEO_PID and 0xFF)
+
+        // program_info_length = 0
+        w(0xF0); w(0x00)
+
+        // ES
+        sec.write(esVideo)
+        sec.write(esAudio)
+
+        val bytesNoCrc = sec.toByteArray()
+        val sectionLen = bytesNoCrc.size - 3 + 4
+        bytesNoCrc[1] = (0xB0 or ((sectionLen shr 8) and 0x0F)).toByte()
+        bytesNoCrc[2] = (sectionLen and 0xFF).toByte()
+
+        val crc = crc32(bytesNoCrc)
+        val out = ByteArray(bytesNoCrc.size + 4)
+        System.arraycopy(bytesNoCrc, 0, out, 0, bytesNoCrc.size)
+        out[out.size - 4] = ((crc ushr 24) and 0xFF).toByte()
+        out[out.size - 3] = ((crc ushr 16) and 0xFF).toByte()
+        out[out.size - 2] = ((crc ushr 8) and 0xFF).toByte()
+        out[out.size - 1] = (crc and 0xFF).toByte()
+        return out
+    }
 
     fun writePatPmt() {
         writePsi(PAT_PID, buildPAT())
@@ -206,16 +238,16 @@ private fun buildPMT(): ByteArray {
         val dts90 = dtsUs?.let { it * 90L }
         val flags = if (dts90 != null) 0xC0 else 0x80
         val headerDataLen = if (dts90 != null) 10 else 5
-        val pesLen = 0 // 0 => unbounded in TS
+        val pesLen = 0 // unbounded
 
         val baos = ByteArrayOutputStream()
         fun w(v: Int) = baos.write(v and 0xFF)
 
-        w(0x00); w(0x00); w(0x01)        // start code
+        w(0x00); w(0x00); w(0x01)
         w(streamId)
         w((pesLen shr 8) and 0xFF); w(pesLen and 0xFF)
-        w(0x80)                          // '10' flags1
-        w(flags)                         // PTS/DTS flags
+        w(0x80)
+        w(flags)
         w(headerDataLen)
 
         fun stamp(marker: Int, v: Long) {
@@ -244,7 +276,7 @@ private fun buildPMT(): ByteArray {
     }
 
     // ------------------------------------------------------------
-    // HEVC helpers (Annex-B)
+    // HEVC: length-prefixed → Annex-B
     // ------------------------------------------------------------
     private fun hevcLengthPrefixedToAnnexB(bytes: ByteArray): ByteArray {
         var off = 0
@@ -271,21 +303,20 @@ private fun buildPMT(): ByteArray {
             96000 -> 0; 88200 -> 1; 64000 -> 2; 48000 -> 3; 44100 -> 4; 32000 -> 5
             24000 -> 6; 22050 -> 7; 16000 -> 8; 12000 -> 9; 11025 -> 10; 8000 -> 11
             7350  -> 12
-            else  -> 3 // default 48k
+            else  -> 3
         }
-        val profile = 1 // AAC LC => '01' (profile index = 1)
+        val profile = 1 // AAC LC
         val chanCfg = channels.coerceIn(1, 2)
 
         val adtsLen = 7 + raw.size
         val hdr = ByteArray(7)
-
         hdr[0] = 0xFF.toByte()
-        hdr[1] = 0xF1.toByte() // 1111 0001 (MPEG-4, layer always 00, protection_absent=1)
+        hdr[1] = 0xF1.toByte()
         hdr[2] = (((profile and 0x3) + 1) shl 6 or ((srIndex and 0xF) shl 2) or ((chanCfg shr 2) and 0x1)).toByte()
         hdr[3] = (((chanCfg and 0x3) shl 6) or ((adtsLen shr 11) and 0x03)).toByte()
         hdr[4] = ((adtsLen shr 3) and 0xFF).toByte()
-        hdr[5] = (((adtsLen and 0x7) shl 5) or 0x1F).toByte() // buffer fullness 0x7FF high bits set
-        hdr[6] = 0xFC.toByte() // 11111100 (number_of_raw_data_blocks_in_frame = 0)
+        hdr[5] = (((adtsLen and 0x7) shl 5) or 0x1F).toByte()
+        hdr[6] = 0xFC.toByte()
 
         val out = ByteArray(hdr.size + raw.size)
         System.arraycopy(hdr, 0, out, 0, hdr.size)
@@ -293,16 +324,25 @@ private fun buildPMT(): ByteArray {
         return out
     }
 
+    private fun looksLikeAdts(buf: ByteArray): Boolean {
+        if (buf.size < 2) return false
+        val b0 = buf[0].toInt() and 0xFF
+        val b1 = buf[1].toInt() and 0xF0
+        return b0 == 0xFF && b1 == 0xF0
+    }
+
     // ------------------------------------------------------------
-    // Public API (usada pelo Pipeline)
+    // API pública (chamada pelo Pipeline)
     // ------------------------------------------------------------
+    fun writePatPmt() {
+        writePsi(PAT_PID, buildPAT())
+        writePsi(PMT_PID, buildPMT())
+    }
+
     fun writeVideoAccessUnit(nalOrFrame: ByteArray, isKeyframe: Boolean, ptsUs: Long, dtsUs: Long, vpsSpsPps: ByteArray?) {
-        // Android MediaCodec normalmente entrega HEVC "length-prefixed" (4 bytes).
-        // Convertemos para Annex-B e, se for keyframe, prefixamos VPS/SPS/PPS (também em Annex-B).
         val frameAnnexB = hevcLengthPrefixedToAnnexB(nalOrFrame)
-        val prefix = if (isKeyframe && vpsSpsPps != null && vpsSpsPps.isNotEmpty()) {
-            hevcLengthPrefixedToAnnexB(vpsSpsPps)
-        } else ByteArray(0)
+        val prefix = if (isKeyframe && vpsSpsPps != null && vpsSpsPps.isNotEmpty())
+            hevcLengthPrefixedToAnnexB(vpsSpsPps) else ByteArray(0)
 
         val payload = ByteArray(prefix.size + frameAnnexB.size).also {
             System.arraycopy(prefix, 0, it, 0, prefix.size)
@@ -318,8 +358,6 @@ private fun buildPMT(): ByteArray {
     }
 
     fun writeAudioFrame(aacEncoderOutput: ByteArray, ptsUs: Long, sampleRate: Int, channels: Int) {
-        // Muitos encoders do Android entregam AAC sem ADTS dentro do MediaCodec.
-        // Garantimos ADTS aqui.
         val withAdts = if (looksLikeAdts(aacEncoderOutput)) aacEncoderOutput
                        else aacWithAdts(aacEncoderOutput, sampleRate, channels)
 
@@ -329,12 +367,5 @@ private fun buildPMT(): ByteArray {
             System.arraycopy(withAdts, 0, it, header.size, withAdts.size)
         }
         splitToTs(AUDIO_PID, ptsUs, pes, 0, pes.size, true)
-    }
-
-    private fun looksLikeAdts(buf: ByteArray): Boolean {
-        if (buf.size < 7) return false
-        val b0 = buf[0].toInt() and 0xFF
-        val b1 = buf[1].toInt() and 0xF6 // mask layer bits to 0
-        return (b0 == 0xFF) && (b1 == 0xF0)
     }
 }
