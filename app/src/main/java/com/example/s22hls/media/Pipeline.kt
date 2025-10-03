@@ -44,20 +44,26 @@ class Pipeline(
 
     private val workDir = File(ctx.cacheDir, "hls-uploader").apply { mkdirs() }
     private var segIndex = 0
-    private var mediaSeq = 0
-    private val playlist = HlsPlaylist(2, 6)
+    private val playlist = HlsPlaylist(
+        targetDurationSec = 3,
+        maxSegments = 6,
+        addIndependentSegmentsTag = true,
+        playlistTypeEvent = false
+    )
 
-    // VPS/SPS/PPS (HEVC) do encoder
     private var vpsSpsPps: ByteArray? = null
 
     fun start() {
         running = true
         Log.i(TAG, "Started uploader pipeline")
 
+        // Handler thread para callbacks da Camera2
         camThread = HandlerThread("Camera2Thread").apply { start() }
         camHandler = Handler(camThread!!.looper)
 
-        scope.launch { openCameraAndStart() }
+        scope.launch {
+            openCameraAndStart()
+        }
     }
 
     fun stop() {
@@ -68,8 +74,13 @@ class Pipeline(
         try { audioCodec?.stop(); audioCodec?.release() } catch(_:Throwable){}
         try { audioRec?.stop(); audioRec?.release() } catch(_:Throwable){}
         scope.cancel()
-        try { camThread?.quitSafely(); camThread?.join() } catch (_:Throwable) {}
-        camHandler = null; camThread = null
+
+        try {
+            camThread?.quitSafely()
+            camThread?.join()
+        } catch (_:Throwable) {}
+        camHandler = null
+        camThread = null
     }
 
     @SuppressLint("MissingPermission")
@@ -88,18 +99,13 @@ class Pipeline(
             else    -> 720
         }
 
-        // ----- ENCODER VÍDEO (HEVC) -----
+        // Encoder de vídeo (HEVC)
         val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_HEVC, w, h).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, videoBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, 30)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2) // IDR a cada ~2s
             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain)
-            // CBR quando suportado
-            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-            // Tentar não deixar QP disparar em idle (nem todo device aceita)
-            setInteger("video-qp-i-max", 44)
-            setInteger("video-qp-p-max", 47)
         }
         val vCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_HEVC).also {
             it.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -107,7 +113,7 @@ class Pipeline(
         videoCodec = vCodec
         val inputSurface = vCodec.createInputSurface()
 
-        // ----- ENCODER ÁUDIO (AAC LC 48kHz estéreo) -----
+        // Encoder de áudio (AAC LC 48kHz estéreo)
         val sr = 48000
         val ch = 2
         val aFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sr, ch).apply {
@@ -119,7 +125,7 @@ class Pipeline(
         }
         audioCodec = aCodec
 
-        // ----- AudioRecord PCM 16-bit -----
+        // AudioRecord (PCM 16-bit)
         val minBuf = AudioRecord.getMinBufferSize(sr, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT)
         val rec = AudioRecord.Builder()
             .setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
@@ -134,7 +140,7 @@ class Pipeline(
             .build()
         audioRec = rec
 
-        // ----- Abrir câmera (com handler/looper dedicados) -----
+        // Abre a câmera
         val open = CompletableDeferred<Unit>()
         cm.openCamera(cam, object : CameraDevice.StateCallback() {
             override fun onOpened(device: CameraDevice) {
@@ -142,19 +148,19 @@ class Pipeline(
                 camDevice = device
                 open.complete(Unit)
             }
-            override fun onDisconnected(device: CameraDevice) {}
+            override fun onDisconnected(device: CameraDevice) { }
             override fun onError(device: CameraDevice, error: Int) {
                 open.completeExceptionally(RuntimeException("cam error $error"))
             }
         }, camHandler)
         open.await()
 
-        // Inicia codecs + áudio
+        // Inicia codecs e captura de áudio
         vCodec.start()
         aCodec.start()
         rec.startRecording()
 
-        // ----- Sessão de captura -----
+        // Sessão de captura
         val outputs = listOf(inputSurface)
         val sessionReady = CompletableDeferred<Unit>()
         camDevice!!.createCaptureSession(outputs, object : CameraCaptureSession.StateCallback() {
@@ -162,8 +168,6 @@ class Pipeline(
                 session = s
                 val req = camDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                     addTarget(inputSurface)
-                    set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                    set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_ON)
                     set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(30, 30))
                 }
                 s.setRepeatingRequest(req.build(), null, camHandler)
@@ -199,11 +203,18 @@ class Pipeline(
                 val isConfig = (bufInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
                 if (isConfig) {
                     vpsSpsPps = data
-                    Log.i(TAG, "Video CSD: VPS/SPS/PPS = ${data.size} bytes")
+                    Log.i(TAG, "Video format changed; got VPS/SPS/PPS (${data.size} bytes)")
                 } else {
                     val isKey = (bufInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
                     synchronized(videoQueue) {
-                        videoQueue.addLast(Encoded(data, bufInfo.presentationTimeUs, bufInfo.presentationTimeUs, if (isKey) 1 else 0))
+                        videoQueue.addLast(
+                            Encoded(
+                                data,
+                                bufInfo.presentationTimeUs,
+                                bufInfo.presentationTimeUs,
+                                if (isKey) 1 else 0
+                            )
+                        )
                     }
                 }
                 codec.releaseOutputBuffer(outIndex, false)
@@ -248,23 +259,25 @@ class Pipeline(
     }
 
     private suspend fun rotationAndUploadLoop() = withContext(Dispatchers.Default) {
-        val targetDurSec = 2.0
+        val targetDurSec = 2.5 // ~2.5s, TARGETDURATION=3
 
         var baos = ByteArrayOutputStream()
         var ts = TsWriter(baos)
 
         var segOpen = false
+        var segStartPtsUs: Long = 0L
         var baseUs: Long = 0L
         var lastVideoPtsUsAdj: Long = 0L
         var lastAudioPtsUsAdj: Long = 0L
 
         fun currentDurSec(): Double =
-            if (!segOpen) 0.0 else (maxOf(lastVideoPtsUsAdj, lastAudioPtsUsAdj) / 1_000_000.0)
+            if (!segOpen) 0.0 else ((maxOf(lastVideoPtsUsAdj, lastAudioPtsUsAdj)) / 1_000_000.0)
 
         fun openNewSegment(startPtsUs: Long) {
             baos = ByteArrayOutputStream()
             ts = TsWriter(baos)
             ts.writePatPmt()
+            segStartPtsUs = startPtsUs
             baseUs = startPtsUs
             lastVideoPtsUsAdj = 0L
             lastAudioPtsUsAdj = 0L
@@ -273,18 +286,19 @@ class Pipeline(
 
         fun closeAndUploadSegment() {
             if (!segOpen) return
-            val segName = "seg_%05d.ts".format(segIndex++)
+            val segName = "seg_%05d.ts".format(segIndex)
             val segBytes = baos.toByteArray()
             val f = File(workDir, segName)
             FileOutputStream(f).use { it.write(segBytes) }
             putFile(segName, segBytes)
 
             val dur = currentDurSec().coerceAtLeast(0.1)
-            playlist.add(segName, dur)
-            val m3u8 = playlist.toText(mediaSeq)
+            // MEDIA-SEQUENCE = índice do primeiro segmento da janela (a lib calcula)
+            playlist.add(segIndex, segName, dur)
+            val m3u8 = playlist.toText()
             putFile("live.m3u8", m3u8.toByteArray(Charsets.UTF_8))
-            mediaSeq += 1
 
+            segIndex += 1
             segOpen = false
         }
 
@@ -298,17 +312,20 @@ class Pipeline(
                     val isKey = (e.flags == 1)
 
                     if (!segOpen) {
-                        if (!isKey) continue
+                        if (!isKey) continue // abre somente em IDR
                         openNewSegment(e.ptsUs)
                     } else {
+                        // fecha no próximo keyframe quando já atingiu a duração alvo
                         if (isKey && currentDurSec() >= targetDurSec) {
                             closeAndUploadSegment()
                             openNewSegment(e.ptsUs)
                         }
                     }
 
+                    // normaliza PTS/DTS do segmento
                     var ptsAdj = (e.ptsUs - baseUs).coerceAtLeast(0L)
                     var dtsAdj = (e.dtsUs - baseUs).coerceAtLeast(0L)
+                    // sem B-frames: DTS <= PTS
                     if (ptsAdj <= lastVideoPtsUsAdj) ptsAdj = lastVideoPtsUsAdj + 1
                     if (dtsAdj > ptsAdj) dtsAdj = ptsAdj
                     lastVideoPtsUsAdj = ptsAdj
@@ -322,6 +339,7 @@ class Pipeline(
             synchronized(audioQueue) {
                 while (segOpen && audioQueue.isNotEmpty()) {
                     val e = audioQueue.removeFirst()
+                    // ignora áudio muito antes do keyframe base
                     if (e.ptsUs < baseUs - 500_000) continue
 
                     var ptsAdj = (e.ptsUs - baseUs).coerceAtLeast(0L)
@@ -334,7 +352,7 @@ class Pipeline(
                 if (!segOpen) audioQueue.clear()
             }
 
-            // segurança (não “emperra” segmento aberto por muito tempo)
+            // fallback de segurança
             if (segOpen && currentDurSec() > 10.0) {
                 closeAndUploadSegment()
             }

@@ -1,39 +1,33 @@
 package com.example.s22hls.media
 
-import java.util.Locale
-import kotlin.math.ceil
-import kotlin.math.max
-
 class HlsPlaylist(
-    private val targetDurationSec: Int = 2,   // mínimo desejado
-    private val maxSegments: Int = 6
+    private val targetDurationSec: Int = 3,
+    private val maxSegments: Int = 6,
+    private val addIndependentSegmentsTag: Boolean = true,
+    private val playlistTypeEvent: Boolean = false
 ) {
-    // (filename, duration)
-    private val entries = ArrayDeque<Pair<String, Double>>()
+    private data class Entry(val seq: Int, val name: String, val durSec: Double)
+    private val entries = ArrayDeque<Entry>() // janela deslizante
 
-    @Synchronized
-    fun add(name: String, durSec: Double) {
-        entries.addLast(name to durSec)
+    fun add(seq: Int, name: String, durSec: Double) {
+        entries.addLast(Entry(seq, name, durSec))
         while (entries.size > maxSegments) entries.removeFirst()
     }
 
-    @Synchronized
-    fun toText(mediaSeqStart: Int): String {
-        // calcula TARGETDURATION como teto do maior EXTINF visível
-        val maxDur = entries.maxOfOrNull { it.second } ?: targetDurationSec.toDouble()
-        val target = max(targetDurationSec, ceil(maxDur).toInt().coerceAtLeast(1))
-
+    fun toText(): String {
         val sb = StringBuilder()
-        sb.append("#EXTM3U\n")
-        sb.append("#EXT-X-VERSION:3\n")
-        sb.append("#EXT-X-INDEPENDENT-SEGMENTS\n")
-        sb.append("#EXT-X-TARGETDURATION:").append(target).append('\n')
-        sb.append("#EXT-X-MEDIA-SEQUENCE:").append(mediaSeqStart).append('\n')
+        sb.appendLine("#EXTM3U")
+        sb.appendLine("#EXT-X-VERSION:3")
+        if (addIndependentSegmentsTag) sb.appendLine("#EXT-X-INDEPENDENT-SEGMENTS")
+        sb.appendLine("#EXT-X-TARGETDURATION:$targetDurationSec")
+        if (playlistTypeEvent) sb.appendLine("#EXT-X-PLAYLIST-TYPE:EVENT")
 
-        for ((name, dur) in entries) {
-            val durStr = String.format(Locale.US, "%.3f", dur)
-            sb.append("#EXTINF:").append(durStr).append(",\n")
-            sb.append(name).append('\n')
+        val mediaSeq = entries.firstOrNull()?.seq ?: 0
+        sb.appendLine("#EXT-X-MEDIA-SEQUENCE:$mediaSeq")
+
+        for (e in entries) {
+            sb.appendLine("#EXTINF:${"%.3f".format(e.durSec)},")
+            sb.appendLine(e.name)
         }
         return sb.toString()
     }
