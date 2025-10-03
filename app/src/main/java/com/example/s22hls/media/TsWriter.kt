@@ -131,55 +131,67 @@ class TsWriter(
     }
 
     private fun buildPAT(): ByteArray {
-        val sec = ByteArray(13)
-        sec[0] = 0x00
-        sec[1] = 0xB0.toByte()
-        sec[2] = 0x0D
-        sec[3] = 0x00; sec[4] = 0x01
-        sec[5] = 0xC1.toByte()
-        sec[6] = 0x00; sec[7] = 0x00
-        sec[8] = 0xE1.toByte(); sec[9] = 0x00
-        val crc = crc32(sec.copyOfRange(0, 12))
-        sec[12] = ((crc ushr 24) and 0xFF).toByte()
-        val rest = byteArrayOf(
-            ((crc ushr 16) and 0xFF).toByte(),
-            ((crc ushr 8) and 0xFF).toByte(),
-            (crc and 0xFF).toByte()
+    val sec = ByteArray(13)
+    sec[0] = 0x00
+    sec[1] = 0xB0.toByte()
+    sec[2] = 0x0D
+    sec[3] = 0x00; sec[4] = 0x01
+    sec[5] = 0xC1.toByte()
+    sec[6] = 0x00; sec[7] = 0x00
+    // ANTES: fixo 0xE1,0x00 (PID 0x0100) -> ERRADO
+    // AGORA: usa PMT_PID corretamente (13 bits: '111' + high 5 bits, depois low 8 bits)
+    sec[8]  = (0xE0 or ((PMT_PID shr 8) and 0x1F)).toByte()
+    sec[9]  = (PMT_PID and 0xFF).toByte()
+    val crc = crc32(sec.copyOfRange(0, 12))
+    sec[12] = ((crc ushr 24) and 0xFF).toByte()
+    val rest = byteArrayOf(((crc ushr 16) and 0xFF).toByte(), ((crc ushr 8) and 0xFF).toByte(), (crc and 0xFF).toByte())
+    return sec + rest
+}
+
+    // --- buildPMT(): CORRIGIR PCR PID e elementary_PID de cada ES ---
+private fun buildPMT(): ByteArray {
+    fun esEntry(streamType: Int, pid: Int): ByteArray {
+        return byteArrayOf(
+            streamType.toByte(),
+            (0xE0 or ((pid shr 8) and 0x1F)).toByte(), // high 5 bits do PID (com '111' prefixados)
+            (pid and 0xFF).toByte(),                   // low 8 bits
+            0xF0.toByte(), 0x00                        // ES_info_length = 0
         )
-        return sec + rest
     }
 
-    private fun buildPMT(): ByteArray {
-        val esVideo = byteArrayOf(
-            STREAM_TYPE_HEVC.toByte(),
-            0xE0.toByte(), (VIDEO_PID and 0xFF).toByte(),
-            0xF0.toByte(), 0x00
-        )
-        val esAudio = byteArrayOf(
-            STREAM_TYPE_AAC.toByte(),
-            0xE0.toByte(), (AUDIO_PID and 0xFF).toByte(),
-            0xF0.toByte(), 0x00
-        )
-        val sec = ByteArray(1024)
-        var i = 0
-        sec[i++] = 0x02
-        sec[i++] = 0xB0.toByte(); sec[i++] = 0 // length placeholder
-        sec[i++] = 0x00; sec[i++] = 0x01
-        sec[i++] = 0xC1.toByte()
-        sec[i++] = 0x00; sec[i++] = 0x00
-        sec[i++] = 0xE1.toByte(); sec[i++] = 0x01 // PCR PID = VIDEO_PID
-        sec[i++] = 0xF0.toByte(); sec[i++] = 0x00 // program info len
-        for (b in esVideo) sec[i++] = b
-        for (b in esAudio) sec[i++] = b
-        val slen = i - 3 + 4 // from after table_id to end incl CRC
-        sec[2] = (slen and 0xFF).toByte()
-        val crc = crc32(sec.copyOfRange(0, i))
-        sec[i++] = ((crc ushr 24) and 0xFF).toByte()
-        sec[i++] = ((crc ushr 16) and 0xFF).toByte()
-        sec[i++] = ((crc ushr 8) and 0xFF).toByte()
-        sec[i++] = (crc and 0xFF).toByte()
-        return sec.copyOfRange(0, i)
-    }
+    val esVideo = esEntry(STREAM_TYPE_HEVC, VIDEO_PID)   // use STREAM_TYPE_H264 (0x1B) se mudar para AVC
+    val esAudio = esEntry(STREAM_TYPE_AAC,  AUDIO_PID)
+
+    val sec = ByteArray(1024)
+    var i = 0
+    sec[i++] = 0x02
+    sec[i++] = 0xB0.toByte(); sec[i++] = 0 // placeholder section_length
+    sec[i++] = 0x00; sec[i++] = 0x01
+    sec[i++] = 0xC1.toByte()
+    sec[i++] = 0x00; sec[i++] = 0x00
+    // PCR PID = VIDEO_PID (13 bits)
+    sec[i++] = (0xE0 or ((VIDEO_PID shr 8) and 0x1F)).toByte()
+    sec[i++] = (VIDEO_PID and 0xFF).toByte()
+    // program_info_length = 0
+    sec[i++] = 0xF0.toByte(); sec[i++] = 0x00
+    // ES entries
+    for (b in esVideo) sec[i++] = b
+    for (b in esAudio) sec[i++] = b
+
+    // section_length (12 bits) = (i - 3) + 4 (CRC)
+    val slen = i - 3 + 4
+    // high 4 bits de section_length entram nos 4 bits baixos de sec[1]
+    sec[1] = (0xB0 or ((slen shr 8) and 0x0F)).toByte()
+    sec[2] = (slen and 0xFF).toByte()
+
+    val crc = crc32(sec.copyOfRange(0, i))
+    sec[i++] = ((crc ushr 24) and 0xFF).toByte()
+    sec[i++] = ((crc ushr 16) and 0xFF).toByte()
+    sec[i++] = ((crc ushr 8) and 0xFF).toByte()
+    sec[i++] = (crc and 0xFF).toByte()
+    return sec.copyOfRange(0, i)
+}
+
 
     fun writePatPmt() {
         writePsi(PAT_PID, buildPAT())
