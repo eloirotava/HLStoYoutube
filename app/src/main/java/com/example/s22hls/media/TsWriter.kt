@@ -331,13 +331,6 @@ class TsWriter(
         return b0 == 0xFF && b1 == 0xF0
     }
 
-    // ------------------------------------------------------------
-    // API pública (chamada pelo Pipeline)
-    // ------------------------------------------------------------
-    fun writePatPmt() {
-        writePsi(PAT_PID, buildPAT())
-        writePsi(PMT_PID, buildPMT())
-    }
 
     fun writeVideoAccessUnit(nalOrFrame: ByteArray, isKeyframe: Boolean, ptsUs: Long, dtsUs: Long, vpsSpsPps: ByteArray?) {
         val frameAnnexB = hevcLengthPrefixedToAnnexB(nalOrFrame)
