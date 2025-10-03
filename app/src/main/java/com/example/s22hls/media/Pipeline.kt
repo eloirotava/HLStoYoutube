@@ -256,53 +256,106 @@ class Pipeline(
     }
 
     private suspend fun rotationAndUploadLoop() = withContext(Dispatchers.Default) {
-        var segStartUs = System.nanoTime() / 1000
-        val baos = ByteArrayOutputStream()
-        val ts = TsWriter(baos)
-        var wroteAny = false
-        ts.writePatPmt()
+    val targetDurSec = 2.0
 
-        while (running) {
-            var wrote = false
-            synchronized(videoQueue) {
-                while (videoQueue.isNotEmpty()) {
-                    val e = videoQueue.removeFirst()
-                    val isKey = e.flags == 1
-                    ts.writeVideoAccessUnit(e.data, isKey, e.ptsUs, e.dtsUs, vpsSpsPps)
-                    wrote = true; wroteAny = true
-                }
-            }
-            synchronized(audioQueue) {
-                while (audioQueue.isNotEmpty()) {
-                    val e = audioQueue.removeFirst()
-                    ts.writeAudioFrame(e.data, e.ptsUs, 48000, 2)
-                    wrote = true; wroteAny = true
-                }
-            }
+    var baos = ByteArrayOutputStream()
+    var ts = TsWriter(baos)
 
-            val nowUs = System.nanoTime() / 1000
-            val durSec = (nowUs - segStartUs) / 1_000_000.0
-            if (durSec >= 2.0 && wroteAny) {
-                val segName = "seg_%05d.ts".format(segIndex++)
-                val segBytes = baos.toByteArray()
-                val f = File(workDir, segName)
-                FileOutputStream(f).use { it.write(segBytes) }
-                putFile(segName, segBytes)
+    var segOpen = false
+    var segStartPtsUs: Long = 0L
+    var lastWrittenPtsUs: Long = 0L
 
-                playlist.add(segName, durSec)
-                val m3u8 = playlist.toText(mediaSeq)
-                putFile("live.m3u8", m3u8.toByteArray(Charsets.UTF_8))
+    fun currentDurSec(): Double =
+        if (!segOpen) 0.0 else ((lastWrittenPtsUs - segStartPtsUs).coerceAtLeast(0L) / 1_000_000.0)
 
-                mediaSeq += 1
-
-                baos.reset()
-                ts.writePatPmt()
-                segStartUs = nowUs
-                wroteAny = false
-            }
-            delay(10)
-        }
+    fun openNewSegment(startPtsUs: Long) {
+        baos = ByteArrayOutputStream()
+        ts = TsWriter(baos)
+        ts.writePatPmt() // sempre começar .ts com PAT/PMT
+        segStartPtsUs = startPtsUs
+        lastWrittenPtsUs = startPtsUs
+        segOpen = true
     }
+
+    fun closeAndUploadSegment() {
+        if (!segOpen) return
+        val segName = "seg_%05d.ts".format(segIndex++)
+        val segBytes = baos.toByteArray()
+        val f = File(workDir, segName)
+        FileOutputStream(f).use { it.write(segBytes) }
+        putFile(segName, segBytes)
+
+        val dur = currentDurSec().coerceAtLeast(0.1)
+        playlist.add(segName, dur)
+        val m3u8 = playlist.toText(mediaSeq)
+        putFile("live.m3u8", m3u8.toByteArray(Charsets.UTF_8))
+        mediaSeq += 1
+
+        // prepara para próximo
+        segOpen = false
+    }
+
+    while (running) {
+        var wroteSomething = false
+
+        // 1) VIDEO: consome tudo que tiver na fila
+        synchronized(videoQueue) {
+            while (videoQueue.isNotEmpty()) {
+                val e = videoQueue.removeFirst()
+                val isKey = (e.flags == 1)
+
+                if (!segOpen) {
+                    // aguardamos um keyframe para abrir o 1º segmento
+                    if (!isKey) continue
+                    openNewSegment(e.ptsUs)
+                    // cai para gravar este keyframe no novo segmento
+                } else {
+                    // se já atingimos a duração alvo e chegou um NOVO keyframe,
+                    // fechamos o segmento atual ANTES de gravar esse keyframe
+                    if (isKey && currentDurSec() >= targetDurSec) {
+                        closeAndUploadSegment()
+                        openNewSegment(e.ptsUs)
+                    }
+                }
+
+                ts.writeVideoAccessUnit(e.data, isKey, e.ptsUs, e.dtsUs, vpsSpsPps)
+                lastWrittenPtsUs = e.ptsUs
+                wroteSomething = true
+            }
+        }
+
+        // 2) AUDIO: só gravamos se o segmento estiver aberto
+        synchronized(audioQueue) {
+            while (segOpen && audioQueue.isNotEmpty()) {
+                val e = audioQueue.removeFirst()
+                // evite áudio muito antes do vídeo: segura se o segmento ainda não tem base PTS válida
+                if (e.ptsUs < segStartPtsUs - 500_000) {
+                    continue
+                }
+                ts.writeAudioFrame(e.data, e.ptsUs, 48000, 2)
+                if (e.ptsUs > lastWrittenPtsUs) lastWrittenPtsUs = e.ptsUs
+                wroteSomething = true
+            }
+            // se não há segmento aberto, descarte áudio acumulado (opcional: poderia limitar tamanho)
+            if (!segOpen) audioQueue.clear()
+        }
+
+        // 3) Fechamento por tempo (fallback): se abrir e não chegar keyframe logo,
+        // não fechamos sem keyframe; o fechamento real acontece quando chegar o keyframe seguinte.
+        // Aqui só deixamos um teto (ex.: 10s) para evitar vazamento de memória.
+        if (segOpen && currentDurSec() > 10.0) {
+            closeAndUploadSegment()
+        }
+
+        if (!wroteSomething) delay(10)
+    }
+
+    // flush final
+    if (segOpen) {
+        closeAndUploadSegment()
+    }
+}
+
 
     private fun putFile(name: String, bytes: ByteArray) {
         try {
