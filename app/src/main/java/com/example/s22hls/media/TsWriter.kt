@@ -25,7 +25,7 @@ class TsWriter(
     private var ccAudio = 0
 
     // ------------------------------------------------------------
-    // TS packet (com stuffing/adaptation field correto)
+    // TS packet (stuffing/adaptation field corretos)
     // ------------------------------------------------------------
     private fun writePacket(
         pid: Int,
@@ -48,7 +48,7 @@ class TsWriter(
         buf[2] = (pid and 0xFF).toByte()
 
         val needPcr = (pcrBase != null) && (pid == pcrPid)
-        val minimalPayloadAvail = 184 - (if (needPcr) 1 + 6 else 0) // 1(flags)+6(PCR)
+        val minimalPayloadAvail = 184 - (if (needPcr) 1 + 6 else 0)
         val willNeedStuffing = len < minimalPayloadAvail
 
         val hasAdaptation = needPcr || willNeedStuffing
@@ -67,7 +67,7 @@ class TsWriter(
                 PMT_PID -> ccPmt
                 VIDEO_PID -> ccVideo
                 else -> ccAudio
-            } and 0x0F)).toByte() // afc=3 (AF + payload)
+            } and 0x0F)).toByte() // afc=3
 
             val afLen = 1 + pcrLen + stuffing
             buf[4] = afLen.toByte()
@@ -92,7 +92,7 @@ class TsWriter(
                 PMT_PID -> ccPmt
                 VIDEO_PID -> ccVideo
                 else -> ccAudio
-            } and 0x0F)).toByte() // afc=1 (somente payload)
+            } and 0x0F)).toByte() // afc=1
         }
 
         val availPayload = 188 - p
@@ -111,7 +111,7 @@ class TsWriter(
 
     private fun writePsi(pid: Int, table: ByteArray) {
         val payload = ByteArray(1 + table.size)
-        payload[0] = 0 // pointer_field = 0
+        payload[0] = 0 // pointer_field
         System.arraycopy(table, 0, payload, 1, table.size)
 
         var off = 0
@@ -125,14 +125,14 @@ class TsWriter(
     }
 
     // ------------------------------------------------------------
-    // PSI (PAT/PMT) com section_length correto
+    // PSI (PAT/PMT)
     // ------------------------------------------------------------
     private fun crc32(bytes: ByteArray): Int {
         var crc = -1
         for (b in bytes) {
             val c = (b.toInt() xor ((crc ushr 24) and 0xFF)) and 0xFF
             var r = c shl 24
-            repeat(8) { r = if ((r and 0x8000_0000.toInt()) != 0) (r shl 1) xor 0x04C11DB7 else r shl 1 }
+            repeat(8) { r = if ((r and 0x80000000.toInt()) != 0) (r shl 1) xor 0x04C11DB7 else r shl 1 }
             crc = (crc shl 8) xor r
         }
         return crc
@@ -266,17 +266,18 @@ class TsWriter(
     }
 
     // ------------------------------------------------------------
-    // HEVC: detecta Annex-B e converte length-prefixed → Annex-B só quando precisa
+    // HEVC config/frames → Annex-B (detecção Annex-B, hvcC, length-prefixed)
     // ------------------------------------------------------------
+    private fun isAnnexB(bytes: ByteArray): Boolean {
+        if (bytes.size < 4) return false
+        val b0 = bytes[0].toInt() and 0xFF
+        val b1 = bytes[1].toInt() and 0xFF
+        val b2 = bytes[2].toInt() and 0xFF
+        val b3 = bytes[3].toInt() and 0xFF
+        return (b0 == 0x00 && b1 == 0x00 && (b2 == 0x01 || (b2 == 0x00 && b3 == 0x01)))
+    }
+
     private fun hevcLengthPrefixedToAnnexB(bytes: ByteArray): ByteArray {
-        if (bytes.size >= 4) {
-            val b0 = bytes[0].toInt() and 0xFF
-            val b1 = bytes[1].toInt() and 0xFF
-            val b2 = bytes[2].toInt() and 0xFF
-            val b3 = bytes[3].toInt() and 0xFF
-            val isAnnexB = (b0 == 0x00 && b1 == 0x00 && (b2 == 0x01 || (b2 == 0x00 && b3 == 0x01)))
-            if (isAnnexB) return bytes
-        }
         var off = 0
         val out = ByteArrayOutputStream()
         while (off + 4 <= bytes.size) {
@@ -291,6 +292,46 @@ class TsWriter(
             off += n
         }
         return out.toByteArray()
+    }
+
+    // hvcC (HEVCDecoderConfigurationRecord) → Annex-B (VPS/SPS/PPS)
+    private fun hevcHvccToAnnexB(csd: ByteArray): ByteArray? {
+        if (csd.isEmpty() || csd[0].toInt() != 1) return null // not hvcC
+        // Posição típica dos arrays: por volta de 21..22; tentamos 21 e 22
+        for (start in intArrayOf(21, 22)) {
+            try {
+                var pos = start
+                val out = ByteArrayOutputStream()
+                val numOfArrays = csd[pos++].toInt() and 0xFF
+                repeat(numOfArrays) {
+                    if (pos + 3 > csd.size) return@repeat
+                    val arrayCompletenessNalType = csd[pos++].toInt() and 0xFF
+                    val nalType = arrayCompletenessNalType and 0x3F
+                    val numNalus = ((csd[pos].toInt() and 0xFF) shl 8) or (csd[pos + 1].toInt() and 0xFF)
+                    pos += 2
+                    repeat(numNalus) {
+                        if (pos + 2 > csd.size) return@repeat
+                        val len = ((csd[pos].toInt() and 0xFF) shl 8) or (csd[pos + 1].toInt() and 0xFF)
+                        pos += 2
+                        if (pos + len > csd.size) return@repeat
+                        out.write(byteArrayOf(0, 0, 0, 1))
+                        out.write(csd, pos, len)
+                        pos += len
+                    }
+                }
+                val arr = out.toByteArray()
+                if (arr.isNotEmpty()) return arr
+            } catch (_: Throwable) { /* tenta próximo offset */ }
+        }
+        return null
+    }
+
+    private fun hevcConfigToAnnexB(bytes: ByteArray): ByteArray {
+        return when {
+            isAnnexB(bytes) -> bytes
+            (bytes.isNotEmpty() && bytes[0].toInt() == 1) -> hevcHvccToAnnexB(bytes) ?: hevcLengthPrefixedToAnnexB(bytes)
+            else -> hevcLengthPrefixedToAnnexB(bytes)
+        }
     }
 
     // ------------------------------------------------------------
@@ -343,9 +384,12 @@ class TsWriter(
     }
 
     fun writeVideoAccessUnit(nalOrFrame: ByteArray, isKeyframe: Boolean, ptsUs: Long, dtsUs: Long, vpsSpsPps: ByteArray?) {
-        val frameAnnexB = hevcLengthPrefixedToAnnexB(nalOrFrame)
+        val frameAnnexB = when {
+            isAnnexB(nalOrFrame) -> nalOrFrame
+            else -> hevcLengthPrefixedToAnnexB(nalOrFrame)
+        }
         val prefix = if (isKeyframe && vpsSpsPps != null && vpsSpsPps.isNotEmpty())
-            hevcLengthPrefixedToAnnexB(vpsSpsPps) else ByteArray(0)
+            hevcConfigToAnnexB(vpsSpsPps) else ByteArray(0)
 
         val payload = ByteArray(prefix.size + frameAnnexB.size).also {
             System.arraycopy(prefix, 0, it, 0, prefix.size)
