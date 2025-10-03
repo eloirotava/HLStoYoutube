@@ -24,7 +24,9 @@ class TsWriter(
     private var ccVideo = 0
     private var ccAudio = 0
 
-    // ÚNICA writePacket (sem reflection)
+    // ------------------------------------------------------------
+    // TS packet
+    // ------------------------------------------------------------
     private fun writePacket(
         pid: Int,
         payloadUnitStart: Boolean,
@@ -49,7 +51,7 @@ class TsWriter(
             else -> ccAudio
         }
 
-        var headerLen = 4
+        val headerLen = 4
         var adaptionLen = 0
         var p = 4
         if (pcrBase != null && pid == pcrPid) {
@@ -58,13 +60,15 @@ class TsWriter(
         buf[3] = ((afc shl 4) or (ccRef and 0x0F)).toByte()
 
         if ((afc and 0x2) != 0) {
-            buf[p++] = 0
+            buf[p++] = 0 // adaptation_field_length (placeholder)
             var flags = 0
             val pcrLen = if (pcrBase != null) 6 else 0
             adaptionLen = 1 + pcrLen
+
             val stuffing = TS_PACKET_SIZE - headerLen - adaptionLen - len
             val stuff = if (stuffing < 0) 0 else stuffing
             adaptionLen += stuff
+
             buf[4] = (adaptionLen - 1).toByte()
             if (pcrBase != null) flags = flags or 0x10
             buf[5] = flags.toByte()
@@ -98,7 +102,7 @@ class TsWriter(
 
     private fun writePsi(pid: Int, table: ByteArray) {
         val payload = ByteArray(1 + table.size)
-        payload[0] = 0
+        payload[0] = 0 // pointer_field
         System.arraycopy(table, 0, payload, 1, table.size)
         var off = 0
         var pusi = true
@@ -110,6 +114,9 @@ class TsWriter(
         }
     }
 
+    // ------------------------------------------------------------
+    // PSI
+    // ------------------------------------------------------------
     private fun crc32(bytes: ByteArray): Int {
         var crc = -0x1
         for (b in bytes) {
@@ -156,7 +163,7 @@ class TsWriter(
         val sec = ByteArray(1024)
         var i = 0
         sec[i++] = 0x02
-        sec[i++] = 0xB0.toByte(); sec[i++] = 0 // placeholder length
+        sec[i++] = 0xB0.toByte(); sec[i++] = 0 // length placeholder
         sec[i++] = 0x00; sec[i++] = 0x01
         sec[i++] = 0xC1.toByte()
         sec[i++] = 0x00; sec[i++] = 0x00
@@ -179,13 +186,15 @@ class TsWriter(
         writePsi(PMT_PID, buildPMT())
     }
 
-    // Refeito sem '+=' em List<Byte>: usa ByteArrayOutputStream
+    // ------------------------------------------------------------
+    // PES helpers
+    // ------------------------------------------------------------
     private fun buildPesHeader(streamId: Int, ptsUs: Long, dtsUs: Long?): ByteArray {
         val pts90 = ptsUs * 90L
         val dts90 = dtsUs?.let { it * 90L }
         val flags = if (dts90 != null) 0xC0 else 0x80
         val headerDataLen = if (dts90 != null) 10 else 5
-        val pesLen = 0
+        val pesLen = 0 // 0 => unbounded in TS
 
         val baos = ByteArrayOutputStream()
         fun w(v: Int) = baos.write(v and 0xFF)
@@ -193,8 +202,8 @@ class TsWriter(
         w(0x00); w(0x00); w(0x01)        // start code
         w(streamId)
         w((pesLen shr 8) and 0xFF); w(pesLen and 0xFF)
-        w(0x80)                          // '10' + flags
-        w(flags)
+        w(0x80)                          // '10' flags1
+        w(flags)                         // PTS/DTS flags
         w(headerDataLen)
 
         fun stamp(marker: Int, v: Long) {
@@ -222,17 +231,73 @@ class TsWriter(
         }
     }
 
-    // Assinaturas públicas usadas pelo Pipeline
-    fun writeVideoAccessUnit(nal: ByteArray, isKeyframe: Boolean, ptsUs: Long, dtsUs: Long, vpsSpsPps: ByteArray?) {
-        // Constrói PES e divide em TS
+    // ------------------------------------------------------------
+    // HEVC helpers (Annex-B)
+    // ------------------------------------------------------------
+    private fun hevcLengthPrefixedToAnnexB(bytes: ByteArray): ByteArray {
+        var off = 0
+        val out = ByteArrayOutputStream()
+        while (off + 4 <= bytes.size) {
+            val n = ((bytes[off].toInt() and 0xFF) shl 24) or
+                    ((bytes[off + 1].toInt() and 0xFF) shl 16) or
+                    ((bytes[off + 2].toInt() and 0xFF) shl 8) or
+                    (bytes[off + 3].toInt() and 0xFF)
+            off += 4
+            if (n <= 0 || off + n > bytes.size) break
+            out.write(byteArrayOf(0, 0, 0, 1))
+            out.write(bytes, off, n)
+            off += n
+        }
+        return out.toByteArray()
+    }
+
+    // ------------------------------------------------------------
+    // AAC ADTS helpers
+    // ------------------------------------------------------------
+    private fun aacWithAdts(raw: ByteArray, sampleRate: Int, channels: Int): ByteArray {
+        val srIndex = when (sampleRate) {
+            96000 -> 0; 88200 -> 1; 64000 -> 2; 48000 -> 3; 44100 -> 4; 32000 -> 5
+            24000 -> 6; 22050 -> 7; 16000 -> 8; 12000 -> 9; 11025 -> 10; 8000 -> 11
+            7350  -> 12
+            else  -> 3 // default 48k
+        }
+        val profile = 1 // AAC LC => '01' (profile index = 1)
+        val chanCfg = channels.coerceIn(1, 2)
+
+        val adtsLen = 7 + raw.size
+        val hdr = ByteArray(7)
+
+        hdr[0] = 0xFF.toByte()
+        hdr[1] = 0xF1.toByte() // 1111 0001 (MPEG-4, layer always 00, protection_absent=1)
+        hdr[2] = (((profile and 0x3) + 1) shl 6 or ((srIndex and 0xF) shl 2) or ((chanCfg shr 2) and 0x1)).toByte()
+        hdr[3] = (((chanCfg and 0x3) shl 6) or ((adtsLen shr 11) and 0x03)).toByte()
+        hdr[4] = ((adtsLen shr 3) and 0xFF).toByte()
+        hdr[5] = (((adtsLen and 0x7) shl 5) or 0x1F).toByte() // buffer fullness 0x7FF high bits set
+        hdr[6] = 0xFC.toByte() // 11111100 (number_of_raw_data_blocks_in_frame = 0)
+
+        val out = ByteArray(hdr.size + raw.size)
+        System.arraycopy(hdr, 0, out, 0, hdr.size)
+        System.arraycopy(raw, 0, out, hdr.size, raw.size)
+        return out
+    }
+
+    // ------------------------------------------------------------
+    // Public API (usada pelo Pipeline)
+    // ------------------------------------------------------------
+    fun writeVideoAccessUnit(nalOrFrame: ByteArray, isKeyframe: Boolean, ptsUs: Long, dtsUs: Long, vpsSpsPps: ByteArray?) {
+        // Android MediaCodec normalmente entrega HEVC "length-prefixed" (4 bytes).
+        // Convertemos para Annex-B e, se for keyframe, prefixamos VPS/SPS/PPS (também em Annex-B).
+        val frameAnnexB = hevcLengthPrefixedToAnnexB(nalOrFrame)
+        val prefix = if (isKeyframe && vpsSpsPps != null && vpsSpsPps.isNotEmpty()) {
+            hevcLengthPrefixedToAnnexB(vpsSpsPps)
+        } else ByteArray(0)
+
+        val payload = ByteArray(prefix.size + frameAnnexB.size).also {
+            System.arraycopy(prefix, 0, it, 0, prefix.size)
+            System.arraycopy(frameAnnexB, 0, it, prefix.size, frameAnnexB.size)
+        }
+
         val header = buildPesHeader(0xE0, ptsUs, dtsUs)
-        // Se for keyframe e vier VPS/SPS/PPS, prefixa antes do NAL
-        val payload = if (isKeyframe && vpsSpsPps != null) {
-            ByteArray(vpsSpsPps.size + nal.size).also {
-                System.arraycopy(vpsSpsPps, 0, it, 0, vpsSpsPps.size)
-                System.arraycopy(nal, 0, it, vpsSpsPps.size, nal.size)
-            }
-        } else nal
         val pes = ByteArray(header.size + payload.size).also {
             System.arraycopy(header, 0, it, 0, header.size)
             System.arraycopy(payload, 0, it, header.size, payload.size)
@@ -240,13 +305,24 @@ class TsWriter(
         splitToTs(VIDEO_PID, ptsUs, pes, 0, pes.size, true)
     }
 
-    fun writeAudioFrame(aacRaw: ByteArray, ptsUs: Long, sampleRate: Int, channels: Int) {
-        // stream_id de áudio normalmente 0xC0
+    fun writeAudioFrame(aacEncoderOutput: ByteArray, ptsUs: Long, sampleRate: Int, channels: Int) {
+        // Muitos encoders do Android entregam AAC sem ADTS dentro do MediaCodec.
+        // Garantimos ADTS aqui.
+        val withAdts = if (looksLikeAdts(aacEncoderOutput)) aacEncoderOutput
+                       else aacWithAdts(aacEncoderOutput, sampleRate, channels)
+
         val header = buildPesHeader(0xC0, ptsUs, null)
-        val pes = ByteArray(header.size + aacRaw.size).also {
+        val pes = ByteArray(header.size + withAdts.size).also {
             System.arraycopy(header, 0, it, 0, header.size)
-            System.arraycopy(aacRaw, 0, it, header.size, aacRaw.size)
+            System.arraycopy(withAdts, 0, it, header.size, withAdts.size)
         }
         splitToTs(AUDIO_PID, ptsUs, pes, 0, pes.size, true)
+    }
+
+    private fun looksLikeAdts(buf: ByteArray): Boolean {
+        if (buf.size < 7) return false
+        val b0 = buf[0].toInt() and 0xFF
+        val b1 = buf[1].toInt() and 0xF6 // mask layer bits to 0
+        return (b0 == 0xFF) && (b1 == 0xF0)
     }
 }

@@ -6,17 +6,16 @@ import android.hardware.camera2.*
 import android.media.*
 import android.util.Log
 import android.util.Range
-import android.view.Surface
 import kotlinx.coroutines.*
 import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
+import android.os.Handler
+import android.os.HandlerThread
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.net.URLEncoder
-import java.nio.ByteBuffer
-import java.util.concurrent.Executors
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
 
 class Pipeline(
     private val ctx: Context,
@@ -37,6 +36,10 @@ class Pipeline(
     private var audioCodec: MediaCodec? = null
     private var audioRec: AudioRecord? = null
 
+    // Thread/Looper para Camera2
+    private var camThread: HandlerThread? = null
+    private var camHandler: Handler? = null
+
     @Volatile private var running = false
 
     private val workDir = File(ctx.cacheDir, "hls-uploader").apply { mkdirs() }
@@ -49,6 +52,11 @@ class Pipeline(
     fun start() {
         running = true
         Log.i(TAG, "Started uploader pipeline")
+
+        // Handler thread para callbacks da Camera2
+        camThread = HandlerThread("Camera2Thread").apply { start() }
+        camHandler = Handler(camThread!!.looper)
+
         scope.launch {
             openCameraAndStart()
         }
@@ -62,6 +70,14 @@ class Pipeline(
         try { audioCodec?.stop(); audioCodec?.release() } catch(_:Throwable){}
         try { audioRec?.stop(); audioRec?.release() } catch(_:Throwable){}
         scope.cancel()
+
+        // encerra a thread/looper da câmera
+        try {
+            camThread?.quitSafely()
+            camThread?.join()
+        } catch (_:Throwable) {}
+        camHandler = null
+        camThread = null
     }
 
     @SuppressLint("MissingPermission")
@@ -69,85 +85,105 @@ class Pipeline(
         val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val cam = cm.cameraIdList.getOrNull(cameraId) ?: cm.cameraIdList.first()
 
-        val w = if (resolution == "1080p") 1920 else if (resolution == "360p") 640 else 1280
-        val h = if (resolution == "1080p") 1080 else if (resolution == "360p") 360 else 720
+        val w = when (resolution) {
+            "1080p" -> 1920
+            "360p"  -> 640
+            else    -> 1280
+        }
+        val h = when (resolution) {
+            "1080p" -> 1080
+            "360p"  -> 360
+            else    -> 720
+        }
 
-        val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_HEVC, w, h)
-        videoFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-        videoFormat.setInteger(MediaFormat.KEY_BIT_RATE, videoBitrate)
-        videoFormat.setInteger(MediaFormat.KEY_FRAME_RATE, 30)
-        videoFormat.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
-        videoFormat.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain)
-
-        val vCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_HEVC)
+        // Config encoder de vídeo (HEVC)
+        val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_HEVC, w, h).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_BIT_RATE, videoBitrate)
+            setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain)
+        }
+        val vCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_HEVC).also {
+            it.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        }
         videoCodec = vCodec
-        vCodec.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         val inputSurface = vCodec.createInputSurface()
 
-        // Audio AAC LC stereo 48k
+        // Config encoder de áudio (AAC LC 48kHz estéreo)
         val sr = 48000
         val ch = 2
-        val aFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sr, ch)
-        aFormat.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
-        aFormat.setInteger(MediaFormat.KEY_BIT_RATE, (audioKbps * 1000).coerceAtLeast(96000))
-        val aCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+        val aFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sr, ch).apply {
+            setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+            setInteger(MediaFormat.KEY_BIT_RATE, (audioKbps * 1000).coerceAtLeast(96_000))
+        }
+        val aCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).also {
+            it.configure(aFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        }
         audioCodec = aCodec
-        aCodec.configure(aFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
 
-        // AudioRecord PCM source
+        // AudioRecord (PCM 16-bit)
         val minBuf = AudioRecord.getMinBufferSize(sr, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT)
         val rec = AudioRecord.Builder()
             .setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
-            .setAudioFormat(AudioFormat.Builder()
-                .setSampleRate(sr)
-                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
-                .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-            .setBufferSizeInBytes(minBuf * 2).build()
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setSampleRate(sr)
+                    .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .build()
+            )
+            .setBufferSizeInBytes(minBuf * 2)
+            .build()
         audioRec = rec
 
-        // Open camera
+        // Abre a câmera (usa Handler com Looper)
         val open = CompletableDeferred<Unit>()
-        cm.openCamera(cam, object: CameraDevice.StateCallback() {
+        cm.openCamera(cam, object : CameraDevice.StateCallback() {
             override fun onOpened(device: CameraDevice) {
                 Log.i(TAG, "Camera onOpened id=${device.id}")
                 camDevice = device
                 open.complete(Unit)
             }
             override fun onDisconnected(device: CameraDevice) { }
-            override fun onError(device: CameraDevice, error: Int) { open.completeExceptionally(RuntimeException("cam error $error")) }
-        }, null)
+            override fun onError(device: CameraDevice, error: Int) {
+                open.completeExceptionally(RuntimeException("cam error $error"))
+            }
+        }, camHandler)
         open.await()
 
-        // Start codecs
+        // Inicia codecs e captura de áudio
         vCodec.start()
         aCodec.start()
         rec.startRecording()
 
-        // Create capture session with encoder surface
+        // Cria a sessão de captura com o surface do encoder
         val outputs = listOf(inputSurface)
         val sessionReady = CompletableDeferred<Unit>()
-        camDevice!!.createCaptureSession(outputs, object: CameraCaptureSession.StateCallback() {
+        camDevice!!.createCaptureSession(outputs, object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(s: CameraCaptureSession) {
                 session = s
                 val req = camDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                     addTarget(inputSurface)
-                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(30,30))
+                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(30, 30))
                 }
-                s.setRepeatingRequest(req.build(), null, null)
+                s.setRepeatingRequest(req.build(), null, camHandler)
                 Log.i(TAG, "CaptureSession configured")
                 sessionReady.complete(Unit)
             }
-            override fun onConfigureFailed(session: CameraCaptureSession) { sessionReady.completeExceptionally(RuntimeException("session failed")) }
-        }, null)
+            override fun onConfigureFailed(session: CameraCaptureSession) {
+                sessionReady.completeExceptionally(RuntimeException("session failed"))
+            }
+        }, camHandler)
         sessionReady.await()
 
-        // Start loops
+        // Loops de saída de áudio/vídeo e rotação/upload HLS
         launch { audioLoop(aCodec, rec) }
         launch { videoLoop(vCodec) }
         launch { rotationAndUploadLoop() }
     }
 
-    private data class Encoded(val data:ByteArray, val ptsUs:Long, val dtsUs:Long = -1, val flags:Int = 0)
+    private data class Encoded(val data: ByteArray, val ptsUs: Long, val dtsUs: Long = -1, val flags: Int = 0)
 
     private val videoQueue = ArrayDeque<Encoded>()
     private val audioQueue = ArrayDeque<Encoded>()
@@ -168,7 +204,14 @@ class Pipeline(
                 } else {
                     val isKey = (bufInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
                     synchronized(videoQueue) {
-                        videoQueue.addLast(Encoded(data, bufInfo.presentationTimeUs, bufInfo.presentationTimeUs, if (isKey) 1 else 0))
+                        videoQueue.addLast(
+                            Encoded(
+                                data,
+                                bufInfo.presentationTimeUs,
+                                bufInfo.presentationTimeUs,
+                                if (isKey) 1 else 0
+                            )
+                        )
                     }
                 }
                 codec.releaseOutputBuffer(outIndex, false)
@@ -214,7 +257,7 @@ class Pipeline(
 
     private suspend fun rotationAndUploadLoop() = withContext(Dispatchers.Default) {
         var segStartUs = System.nanoTime() / 1000
-        var baos = ByteArrayOutputStream()
+        val baos = ByteArrayOutputStream()
         val ts = TsWriter(baos)
         var wroteAny = false
         ts.writePatPmt()
@@ -261,7 +304,7 @@ class Pipeline(
         }
     }
 
-    private fun putFile(name:String, bytes:ByteArray) {
+    private fun putFile(name: String, bytes: ByteArray) {
         try {
             val url = if (baseUrl.contains("file=")) {
                 baseUrl + URLEncoder.encode(name, "UTF-8")
@@ -278,7 +321,7 @@ class Pipeline(
                     Log.e(TAG, "Playlist upload failed body=${resp.body?.string()}")
                 }
             }
-        } catch (t:Throwable){
+        } catch (t: Throwable) {
             Log.e(TAG, "PUT $name failed: ${t.message}")
         }
     }
