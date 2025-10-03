@@ -44,12 +44,11 @@ class TsWriter(
         val tei = 0
         val pusi = if (payloadUnitStart) 0x40 else 0x00
         val tp = 0
-        buf[1] = (tei or pusi or tp or ((pid shr 8) and 0x1F)).toByte()  // high 5 bits do PID
-        buf[2] = (pid and 0xFF).toByte()                                 // low 8 bits do PID
+        buf[1] = (tei or pusi or tp or ((pid shr 8) and 0x1F)).toByte()
+        buf[2] = (pid and 0xFF).toByte()
 
-        // Decidimos se haverá adaptation field: PCR ou stuffing quando payload < 184
         val needPcr = (pcrBase != null) && (pid == pcrPid)
-        val minimalPayloadAvail = 184 - (if (needPcr) 1 + 6 else 0) // 1(flags) + 6(PCR)
+        val minimalPayloadAvail = 184 - (if (needPcr) 1 + 6 else 0) // 1(flags)+6(PCR)
         val willNeedStuffing = len < minimalPayloadAvail
 
         val hasAdaptation = needPcr || willNeedStuffing
@@ -60,8 +59,6 @@ class TsWriter(
 
         if (hasAdaptation) {
             if (needPcr) { afFlags = afFlags or 0x10; pcrLen = 6 }
-            // cálculo de stuffing: após header(4) + 1(len) + 1(flags) + pcr(0/6),
-            // payload disponível = 188 - (4 + 1 + 1 + pcrLen)
             val availAfterAF = 188 - (4 + 1 + 1 + pcrLen)
             stuffing = if (len < availAfterAF) (availAfterAF - len) else 0
 
@@ -72,7 +69,6 @@ class TsWriter(
                 else -> ccAudio
             } and 0x0F)).toByte() // afc=3 (AF + payload)
 
-            // adaptation_field_length = flags(1) + PCR(0/6) + stuffing
             val afLen = 1 + pcrLen + stuffing
             buf[4] = afLen.toByte()
             buf[5] = afFlags.toByte()
@@ -89,7 +85,7 @@ class TsWriter(
             }
             repeat(stuffing) { buf[q++] = 0xFF.toByte() }
 
-            p = 4 + 1 + afLen // header(4) + length + afLen
+            p = 4 + 1 + afLen
         } else {
             buf[3] = ((0x1 shl 4) or (when (pid) {
                 PAT_PID -> ccPat
@@ -114,7 +110,6 @@ class TsWriter(
     }
 
     private fun writePsi(pid: Int, table: ByteArray) {
-        // pointer_field + seção
         val payload = ByteArray(1 + table.size)
         payload[0] = 0 // pointer_field = 0
         System.arraycopy(table, 0, payload, 1, table.size)
@@ -148,10 +143,10 @@ class TsWriter(
         fun w(v: Int) = sec.write(v and 0xFF)
 
         w(0x00) // table_id
-        w(0xB0); w(0x00) // section_syntax_indicator(1), '0'(1), reserved(2), section_length(12) [placeholder]
+        w(0xB0); w(0x00) // section_length placeholder
 
         w(0x00); w(0x01) // transport_stream_id
-        w(0xC1)          // version_number(5=0), current_next=1
+        w(0xC1)          // version/current_next
         w(0x00)          // section_number
         w(0x00)          // last_section_number
 
@@ -161,7 +156,7 @@ class TsWriter(
         w(PMT_PID and 0xFF)
 
         val bytesNoCrc = sec.toByteArray()
-        val sectionLen = bytesNoCrc.size - 3 + 4 // from after table_id to end incl CRC
+        val sectionLen = bytesNoCrc.size - 3 + 4
         bytesNoCrc[1] = (0xB0 or ((sectionLen shr 8) and 0x0F)).toByte()
         bytesNoCrc[2] = (sectionLen and 0xFF).toByte()
 
@@ -225,11 +220,6 @@ class TsWriter(
         return out
     }
 
-    fun writePatPmt() {
-        writePsi(PAT_PID, buildPAT())
-        writePsi(PMT_PID, buildPMT())
-    }
-
     // ------------------------------------------------------------
     // PES helpers
     // ------------------------------------------------------------
@@ -276,9 +266,17 @@ class TsWriter(
     }
 
     // ------------------------------------------------------------
-    // HEVC: length-prefixed → Annex-B
+    // HEVC: detecta Annex-B e converte length-prefixed → Annex-B só quando precisa
     // ------------------------------------------------------------
     private fun hevcLengthPrefixedToAnnexB(bytes: ByteArray): ByteArray {
+        if (bytes.size >= 4) {
+            val b0 = bytes[0].toInt() and 0xFF
+            val b1 = bytes[1].toInt() and 0xFF
+            val b2 = bytes[2].toInt() and 0xFF
+            val b3 = bytes[3].toInt() and 0xFF
+            val isAnnexB = (b0 == 0x00 && b1 == 0x00 && (b2 == 0x01 || (b2 == 0x00 && b3 == 0x01)))
+            if (isAnnexB) return bytes
+        }
         var off = 0
         val out = ByteArrayOutputStream()
         while (off + 4 <= bytes.size) {
@@ -296,7 +294,7 @@ class TsWriter(
     }
 
     // ------------------------------------------------------------
-    // AAC ADTS helpers
+    // AAC ADTS helpers (AAC LC correto)
     // ------------------------------------------------------------
     private fun aacWithAdts(raw: ByteArray, sampleRate: Int, channels: Int): ByteArray {
         val srIndex = when (sampleRate) {
@@ -305,17 +303,22 @@ class TsWriter(
             7350  -> 12
             else  -> 3
         }
-        val profile = 1 // AAC LC
-        val chanCfg = channels.coerceIn(1, 2)
+        val profileIndex = 1 // AAC LC
+        val chanCfg = channels.coerceIn(1, 7)
 
         val adtsLen = 7 + raw.size
         val hdr = ByteArray(7)
+
         hdr[0] = 0xFF.toByte()
         hdr[1] = 0xF1.toByte()
-        hdr[2] = (((profile and 0x3) + 1) shl 6 or ((srIndex and 0xF) shl 2) or ((chanCfg shr 2) and 0x1)).toByte()
-        hdr[3] = (((chanCfg and 0x3) shl 6) or ((adtsLen shr 11) and 0x03)).toByte()
+        hdr[2] = (((profileIndex and 0x3) shl 6)
+                 or ((srIndex and 0xF) shl 2)
+                 or ((chanCfg shr 2) and 0x1)).toByte()
+        hdr[3] = (((chanCfg and 0x3) shl 6)
+                 or ((adtsLen shr 11) and 0x03)).toByte()
         hdr[4] = ((adtsLen shr 3) and 0xFF).toByte()
-        hdr[5] = (((adtsLen and 0x7) shl 5) or 0x1F).toByte()
+        hdr[5] = (((adtsLen and 0x7) shl 5)
+                 or 0x1F).toByte()
         hdr[6] = 0xFC.toByte()
 
         val out = ByteArray(hdr.size + raw.size)
@@ -331,6 +334,13 @@ class TsWriter(
         return b0 == 0xFF && b1 == 0xF0
     }
 
+    // ------------------------------------------------------------
+    // API pública (chamada pelo Pipeline)
+    // ------------------------------------------------------------
+    fun writePatPmt() {
+        writePsi(PAT_PID, buildPAT())
+        writePsi(PMT_PID, buildPMT())
+    }
 
     fun writeVideoAccessUnit(nalOrFrame: ByteArray, isKeyframe: Boolean, ptsUs: Long, dtsUs: Long, vpsSpsPps: ByteArray?) {
         val frameAnnexB = hevcLengthPrefixedToAnnexB(nalOrFrame)
