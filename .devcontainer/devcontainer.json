@@ -1,0 +1,21 @@
+{
+  "name": "Android 15 Builder",
+  "image": "auto",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "vscjava.vscode-gradle",
+        "redhat.java",
+        "mhutchie.git-graph",
+        "ms-azuretools.vscode-docker",
+        "google.android-emulator"
+      ]
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/scripts/setup-android-sdk.sh",
+  "remoteUser": "vscode"
+}

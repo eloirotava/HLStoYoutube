@@ -1,0 +1,10 @@
+[
+    {
+        "merged": "com.example.s22hls.app-debug-33:/xml_network_security_config.xml.flat",
+        "source": "com.example.s22hls.app-main-35:/xml/network_security_config.xml"
+    },
+    {
+        "merged": "com.example.s22hls.app-debug-33:/layout_activity_main.xml.flat",
+        "source": "com.example.s22hls.app-main-35:/layout/activity_main.xml"
+    }
+]

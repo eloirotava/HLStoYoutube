@@ -1,0 +1,17 @@
+R_DEF: Internal format may change without notice
+local
+id btnStart
+id btnStop
+id etAudioK
+id etBitrate
+id etCameraId
+id etRes
+id etUrl
+id tvStatus
+layout activity_main
+string app_name
+string save
+string start
+string stop
+style Theme.S22HlsToVps
+xml network_security_config

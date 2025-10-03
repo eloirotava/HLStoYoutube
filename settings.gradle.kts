@@ -12,5 +12,5 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "S22HlsStreamer"
+rootProject.name = "S22HlsToVps"
 include(":app")

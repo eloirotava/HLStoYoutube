@@ -1,96 +1,71 @@
 package com.example.s22hls
 
 import android.Manifest
-import android.content.ComponentName
-import android.content.Context
 import android.content.Intent
-import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Bundle
-import android.os.IBinder
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.input.TextFieldValue
-import androidx.compose.ui.unit.dp
+import android.widget.*
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.lifecycleScope
-import com.example.s22hls.ui.AppTheme
-import kotlinx.coroutines.launch
 
-class MainActivity : ComponentActivity() {
+class MainActivity : AppCompatActivity() {
 
-    private var bound by mutableStateOf(false)
-    private var service: StreamingService? = null
-
-    private val conn = object: ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-            service = (binder as StreamingService.LocalBinder).service
-            bound = true
-        }
-        override fun onServiceDisconnected(name: ComponentName?) {
-            bound = false
-            service = null
-        }
-    }
-
-    private val permissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { _ -> /* no-op; UI will reflect current permission status */ }
+    private lateinit var etUrl: EditText
+    private lateinit var etCameraId: EditText
+    private lateinit var etRes: EditText
+    private lateinit var etBitrate: EditText
+    private lateinit var etAudioK: EditText
+    private lateinit var tvStatus: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent {
-            AppTheme {
-                Surface(Modifier.fillMaxSize()) {
-                    ConfigScreen(
-                        onStart = { cfg ->
-                            ensurePermissions {
-                                val intent = Intent(this, StreamingService::class.java).apply {
-                                    action = StreamingService.ACTION_START
-                                    putExtra(StreamingService.EXTRA_CAMERA_ID, cfg.cameraId)
-                                    putExtra(StreamingService.EXTRA_RESOLUTION, cfg.resolution)
-                                    putExtra(StreamingService.EXTRA_VIDEO_BITRATE_KBPS, cfg.videoBitrateKbps)
-                                    putExtra(StreamingService.EXTRA_OUTPUT_URL, cfg.outputUrl)
-                                }
-                                ContextCompat.startForegroundService(this, intent)
-                                bindService(Intent(this, StreamingService::class.java), conn, Context.BIND_AUTO_CREATE)
-                            }
-                        },
-                        onStop = {
-                            val intent = Intent(this, StreamingService::class.java).apply {
-                                action = StreamingService.ACTION_STOP
-                            }
-                            startService(intent)
-                            if (bound) unbindService(conn)
-                        }
-                    )
-                }
+        setContentView(R.layout.activity_main)
+
+        etUrl = findViewById(R.id.etUrl)
+        etCameraId = findViewById(R.id.etCameraId)
+        etRes = findViewById(R.id.etRes)
+        etBitrate = findViewById(R.id.etBitrate)
+        etAudioK = findViewById(R.id.etAudioK)
+        tvStatus = findViewById(R.id.tvStatus)
+
+        findViewById<Button>(R.id.btnStart).setOnClickListener {
+            if (!hasPermissions()) {
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO),
+                    100
+                )
+                return@setOnClickListener
             }
+            startStreaming()
+        }
+        findViewById<Button>(R.id.btnStop).setOnClickListener {
+            stopService(Intent(this, StreamingService::class.java))
+            tvStatus.text = "Parado"
         }
     }
 
-    private fun ensurePermissions(after: () -> Unit) {
-        val need = listOf(
-            Manifest.permission.CAMERA,
-            Manifest.permission.RECORD_AUDIO
-        ).any { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
-        if (need) {
-            permissionLauncher.launch(arrayOf(
-                Manifest.permission.CAMERA,
-                Manifest.permission.RECORD_AUDIO
-            ))
-        } else after()
+    private fun hasPermissions(): Boolean {
+        return (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                && ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
     }
 
-    override fun onDestroy() {
-        if (bound) unbindService(conn)
-        super.onDestroy()
+    private fun startStreaming() {
+        val url = etUrl.text.toString().trim()
+        val camId = etCameraId.text.toString().ifEmpty { "0" }.toInt()
+        val res = etRes.text.toString().ifEmpty { "720p" }
+        val br = etBitrate.text.toString().ifEmpty { "800000" }.toInt()
+        val ak = etAudioK.text.toString().ifEmpty { "96" }.toInt()
+
+        val i = Intent(this, StreamingService::class.java).apply {
+            putExtra("url", url)
+            putExtra("cameraId", camId)
+            putExtra("res", res)
+            putExtra("vBitrate", br)
+            putExtra("aKbps", ak)
+        }
+        ContextCompat.startForegroundService(this, i)
+        tvStatus.text = "Iniciando..."
     }
 }

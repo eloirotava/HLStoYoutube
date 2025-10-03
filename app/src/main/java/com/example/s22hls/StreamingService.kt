@@ -2,100 +2,48 @@ package com.example.s22hls
 
 import android.app.*
 import android.content.Intent
-import android.os.Binder
+import android.os.Build
 import android.os.IBinder
-import android.util.Log
 import androidx.core.app.NotificationCompat
-import kotlinx.coroutines.*
+import com.example.s22hls.media.Pipeline
 
 class StreamingService : Service() {
 
-    companion object {
-        const val ACTION_START = "com.example.s22hls.action.START"
-        const val ACTION_STOP  = "com.example.s22hls.action.STOP"
+    private var pipeline: Pipeline? = null
 
-        const val EXTRA_CAMERA_ID = "cameraId"
-        const val EXTRA_RESOLUTION = "resolution"
-        const val EXTRA_VIDEO_BITRATE_KBPS = "videoBitrateKbps"
-        const val EXTRA_OUTPUT_URL = "outputUrl"
+    override fun onBind(intent: Intent?): IBinder? = null
 
-        private const val CHANNEL_ID = "streaming"
-        private const val NOTIF_ID = 42
+    override fun onCreate() {
+        super.onCreate()
+        val chanId = "streaming"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val chan = NotificationChannel(chanId, "Streaming", NotificationManager.IMPORTANCE_LOW)
+            val nm = getSystemService(NotificationManager::class.java)
+            nm.createNotificationChannel(chan)
+        }
+        val notif = NotificationCompat.Builder(this, chanId)
+            .setContentTitle("Transmitindo")
+            .setContentText("HLS ativo")
+            .setSmallIcon(android.R.drawable.presence_video_online)
+            .setOngoing(true)
+            .build()
+        startForeground(1, notif)
     }
 
-    private val binder = LocalBinder()
-    inner class LocalBinder : Binder() { val service get() = this@StreamingService }
-
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-
-    override fun onBind(intent: Intent?): IBinder = binder
-
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_START -> startStreaming(intent)
-            ACTION_STOP  -> stopStreaming()
-        }
+        val url = intent?.getStringExtra("url") ?: return START_NOT_STICKY
+        val camId = intent.getIntExtra("cameraId", 0)
+        val res = intent.getStringExtra("res") ?: "720p"
+        val vBitrate = intent.getIntExtra("vBitrate", 800_000)
+        val aKbps = intent.getIntExtra("aKbps", 96)
+
+        pipeline?.stop()
+        pipeline = Pipeline(this, url, camId, res, vBitrate, aKbps).apply { start() }
         return START_STICKY
     }
 
-    private fun startStreaming(intent: Intent) {
-        val cameraId = intent.getStringExtra(EXTRA_CAMERA_ID) ?: return
-        val resolution = intent.getStringExtra(EXTRA_RESOLUTION) ?: "720p"
-        val kbps = intent.getIntExtra(EXTRA_VIDEO_BITRATE_KBPS, 1200)
-        val url = intent.getStringExtra(EXTRA_OUTPUT_URL) ?: return
-
-        startForegroundWithNotification("Preparando…")
-
-        scope.launch {
-            try {
-                val pipeline = media.Pipeline(
-                    service = this@StreamingService,
-                    cameraId = cameraId,
-                    resolution = resolution,
-                    videoBitrateKbps = kbps,
-                    outputUrl = url
-                )
-                pipeline.start()
-                updateNotification("Transmitindo")
-                // Keep running until cancelled
-                pipeline.awaitUntilStopped()
-            } catch (t: Throwable) {
-                Log.e("StreamingService", "Erro na transmissão", t)
-                updateNotification("Erro: ${t.message}")
-                stopSelf()
-            }
-        }
-    }
-
-    private fun stopStreaming() {
-        updateNotification("Parando…")
-        scope.cancel()
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
-    }
-
-    private fun startForegroundWithNotification(text: String) {
-        val nm = getSystemService(NotificationManager::class.java)
-        if (nm.getNotificationChannel(CHANNEL_ID) == null) {
-            nm.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Streaming", NotificationManager.IMPORTANCE_LOW))
-        }
-        val notif = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setContentTitle("S22HlsStreamer")
-            .setContentText(text)
-            .setOngoing(true)
-            .build()
-        startForeground(NOTIF_ID, notif)
-    }
-
-    private fun updateNotification(text: String) {
-        val notif = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setContentTitle("S22HlsStreamer")
-            .setContentText(text)
-            .setOngoing(true)
-            .build()
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.notify(NOTIF_ID, notif)
+    override fun onDestroy() {
+        pipeline?.stop()
+        super.onDestroy()
     }
 }
