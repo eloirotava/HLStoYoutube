@@ -26,13 +26,11 @@ class TsWriter(
 
     private fun usTo90k(us: Long): Long = (us * 9L) / 100L
 
-    // ------------------------------------------------------------
-    // TS packet (adaptation/PCR/stuffing)
-    // ------------------------------------------------------------
+    // ---------------- TS packet (adaptação/PCR/stuffing) ----------------
     private fun writePacket(
         pid: Int,
         payloadUnitStart: Boolean,
-        pcrBase: Long?,
+        pcrBase90k: Long?,        // PCR em 90 kHz (NÃO em µs!)
         data: ByteArray,
         offset: Int,
         length: Int
@@ -47,11 +45,11 @@ class TsWriter(
         buf[1] = (pusi or ((pid shr 8) and 0x1F)).toByte()
         buf[2] = (pid and 0xFF).toByte()
 
-        val needPcr = (pcrBase != null) && (pid == pcrPid)
-        val minimalPayloadAvail = 184 - (if (needPcr) 1 + 6 else 0)
-        val willNeedStuffing = len < minimalPayloadAvail
+        val needPcr = (pcrBase90k != null) && (pid == pcrPid)
+        val minPayload = 184 - (if (needPcr) 1 + 6 else 0)
+        val willStuff = len < minPayload
 
-        val hasAdaptation = needPcr || willNeedStuffing
+        val hasAdapt = needPcr || willStuff
         var p = 4
         var afFlags = 0
         var pcrLen = 0
@@ -64,18 +62,18 @@ class TsWriter(
             else -> ccAudio
         }
 
-        if (hasAdaptation) {
+        if (hasAdapt) {
             if (needPcr) { afFlags = afFlags or 0x10; pcrLen = 6 }
             val availAfterAF = 188 - (4 + 1 + 1 + pcrLen)
             stuffing = if (len < availAfterAF) (availAfterAF - len) else 0
 
-            buf[3] = ((0x2 or 0x1) shl 4 or (cc and 0x0F)).toByte() // afc=3
+            buf[3] = (((0x2) or 0x1) shl 4 or (cc and 0x0F)).toByte() // afc=3
             val afLen = 1 + pcrLen + stuffing
             buf[4] = afLen.toByte()
             buf[5] = afFlags.toByte()
             var q = 6
             if (needPcr) {
-                val pcr = pcrBase!! * 300
+                val pcr = pcrBase90k!! * 300
                 buf[q++] = ((pcr shr 25) and 0xFF).toByte()
                 buf[q++] = ((pcr shr 17) and 0xFF).toByte()
                 buf[q++] = ((pcr shr 9) and 0xFF).toByte()
@@ -86,7 +84,7 @@ class TsWriter(
             repeat(stuffing) { buf[q++] = 0xFF.toByte() }
             p = 4 + 1 + afLen
         } else {
-            buf[3] = ((0x1 shl 4) or (cc and 0x0F)).toByte() // afc=1 (payload only)
+            buf[3] = ((0x1 shl 4) or (cc and 0x0F)).toByte() // payload only
         }
 
         val n = min(188 - p, len)
@@ -116,9 +114,7 @@ class TsWriter(
         }
     }
 
-    // ------------------------------------------------------------
-    // PSI (PAT/PMT)
-    // ------------------------------------------------------------
+    // ---------------- PSI (PAT/PMT) ----------------
     private fun crc32(bytes: ByteArray): Int {
         var crc = -1
         for (b in bytes) {
@@ -134,9 +130,9 @@ class TsWriter(
         val sec = ByteArrayOutputStream()
         fun w(v: Int) = sec.write(v and 0xFF)
         w(0x00)               // table_id
-        w(0xB0); w(0x00)      // section_length placeholder
+        w(0xB0); w(0x00)      // section_length (placeholder)
         w(0x00); w(0x01)      // transport_stream_id
-        w(0xC1)               // version/current_next
+        w(0xC1)               // version(1)/current_next(1)
         w(0x00)               // section_number
         w(0x00)               // last_section_number
         // program_number=1 -> PMT_PID
@@ -169,7 +165,7 @@ class TsWriter(
         val sec = ByteArrayOutputStream()
         fun w(v: Int) = sec.write(v and 0xFF)
         w(0x02)               // table_id
-        w(0xB0); w(0x00)      // section_length placeholder
+        w(0xB0); w(0x00)      // section_length (placeholder)
         w(0x00); w(0x01)      // program_number
         w(0xC1)               // version/current_next
         w(0x00)               // section_number
@@ -195,9 +191,7 @@ class TsWriter(
         )
     }
 
-    // ------------------------------------------------------------
-    // PES
-    // ------------------------------------------------------------
+    // ---------------- PES ----------------
     private fun buildPesHeader(streamId: Int, ptsUs: Long, dtsUs: Long?): ByteArray {
         val pts90 = ptsUs * 90L
         val dts90 = dtsUs?.let { it * 90L }
@@ -223,21 +217,19 @@ class TsWriter(
         return baos.toByteArray()
     }
 
-    private fun splitToTs(pid: Int, pcrTimeUs: Long?, data: ByteArray, off0: Int, len0: Int, pusi: Boolean) {
+    private fun splitToTs(pid: Int, pcrBase90k: Long?, data: ByteArray, off0: Int, len0: Int, pusi: Boolean) {
         var off = off0
         var len = len0
         var first = true
         while (len > 0) {
-            val n = writePacket(pid, pusi && first, if (first) pcrTimeUs else null, data, off, len)
+            val n = writePacket(pid, pusi && first, if (first) pcrBase90k else null, data, off, len)
             off += n
             len -= n
             first = false
         }
     }
 
-    // ------------------------------------------------------------
-    // HEVC helpers (Annex-B, hvcC parsing, AUD, ordenação VPS/SPS/PPS)
-    // ------------------------------------------------------------
+    // ---------------- HEVC helpers ----------------
     private fun isAnnexB(bytes: ByteArray): Boolean {
         if (bytes.size < 4) return false
         val b0 = bytes[0].toInt() and 0xFF
@@ -298,7 +290,7 @@ class TsWriter(
                 repeat(numOfArrays) {
                     if (pos + 3 > csd.size) return@repeat
                     val arrayHdr = csd[pos++].toInt() and 0xFF
-                    val nalType = arrayHdr and 0x3F
+                    /* val nalTypeArr = arrayHdr and 0x3F */ // não usado
                     val numNalus = ((csd[pos].toInt() and 0xFF) shl 8) or (csd[pos + 1].toInt() and 0xFF); pos += 2
                     repeat(numNalus) {
                         if (pos + 2 > csd.size) return@repeat
@@ -325,13 +317,12 @@ class TsWriter(
     }
 
     private fun buildAudNal(): ByteArray {
-        // AUD (nal_unit_type 35). Conteúdo mínimo (no_rbsp), startcode + header + 1 byte.
+        // AUD (nal_unit_type 35) mínimo
         val baos = ByteArrayOutputStream()
         baos.write(byteArrayOf(0,0,0,1))
-        // forbidden_zero_bit=0, nal_unit_type=35 (AUD), nuh_layer_id=0, nuh_temporal_id_plus1=1
-        baos.write( (0 shl 7) or (35 shl 1) or 0 )          // first byte (forbidden+type high)
-        baos.write( (0 shl 5) or (1) )                      // second byte (layer_id=0, tid+1=1)
-        baos.write(0x50) // aud_irap_or_idr_pic_flag(1)=0 etc. byte dummy aceitável
+        baos.write((35 shl 1) or 0) // forbidden_zero_bit=0 + type
+        baos.write(1)               // tid+1 = 1
+        baos.write(0x50)            // dummy payload
         return baos.toByteArray()
     }
 
@@ -357,9 +348,7 @@ class TsWriter(
         return out.toByteArray()
     }
 
-    // ------------------------------------------------------------
-    // AAC (ADTS)
-    // ------------------------------------------------------------
+    // ---------------- AAC (ADTS) ----------------
     private fun aacWithAdts(raw: ByteArray, sampleRate: Int, channels: Int): ByteArray {
         val srIndex = when (sampleRate) {
             96000 -> 0; 88200 -> 1; 64000 -> 2; 48000 -> 3; 44100 -> 4; 32000 -> 5
@@ -376,13 +365,12 @@ class TsWriter(
         hdr[0] = 0xFF.toByte()
         hdr[1] = 0xF1.toByte()
         hdr[2] = (((profileIndex and 0x3) shl 6)
-                 or ((srIndex and 0xF) shl 2)
-                 or ((chanCfg shr 2) and 0x1)).toByte()
+                or ((srIndex and 0xF) shl 2)
+                or ((chanCfg shr 2) and 0x1)).toByte()
         hdr[3] = (((chanCfg and 0x3) shl 6)
-                 or ((adtsLen shr 11) and 0x03)).toByte()
+                or ((adtsLen shr 11) and 0x03)).toByte()
         hdr[4] = ((adtsLen shr 3) and 0xFF).toByte()
-        hdr[5] = (((adtsLen and 0x7) shl 5)
-                 or 0x1F).toByte()
+        hdr[5] = ((((adtsLen and 0x7)) shl 5) or 0x1F).toByte()
         hdr[6] = 0xFC.toByte()
 
         val out = ByteArray(hdr.size + raw.size)
@@ -398,20 +386,14 @@ class TsWriter(
         return b0 == 0xFF && b1 == 0xF0
     }
 
-    // ------------------------------------------------------------
-    // API pública
-    // ------------------------------------------------------------
+    // ---------------- API pública ----------------
     fun writePatPmt() {
         writePsi(PAT_PID, buildPAT())
         writePsi(PMT_PID, buildPMT())
     }
 
     fun writeVideoAccessUnit(nalOrFrame: ByteArray, isKeyframe: Boolean, ptsUs: Long, dtsUs: Long, vpsSpsPps: ByteArray?) {
-        val frameAnnexB = when {
-            isAnnexB(nalOrFrame) -> nalOrFrame
-            else -> hevcLengthPrefixedToAnnexB(nalOrFrame)
-        }
-
+        val frameAnnexB = if (isAnnexB(nalOrFrame)) nalOrFrame else hevcLengthPrefixedToAnnexB(nalOrFrame)
         val aud = buildAudNal()
         val cfg = if (isKeyframe && vpsSpsPps != null && vpsSpsPps.isNotEmpty())
             orderedVpsSpsPps(vpsSpsPps) else ByteArray(0)
@@ -428,6 +410,7 @@ class TsWriter(
             System.arraycopy(header, 0, it, 0, header.size)
             System.arraycopy(payload, 0, it, header.size, payload.size)
         }
+        // PCR **somente** no vídeo, e em 90 kHz
         splitToTs(VIDEO_PID, usTo90k(ptsUs), pes, 0, pes.size, true)
     }
 
@@ -439,6 +422,7 @@ class TsWriter(
             System.arraycopy(header, 0, it, 0, header.size)
             System.arraycopy(withAdts, 0, it, header.size, withAdts.size)
         }
-        splitToTs(AUDIO_PID, ptsUs, pes, 0, pes.size, true)
+        // Áudio **NÃO** carrega PCR
+        splitToTs(AUDIO_PID, null, pes, 0, pes.size, true)
     }
 }
