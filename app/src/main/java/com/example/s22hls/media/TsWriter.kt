@@ -193,29 +193,34 @@ class TsWriter(
 
     // ---------------- PES ----------------
     private fun buildPesHeader(streamId: Int, ptsUs: Long, dtsUs: Long?): ByteArray {
-        val pts90 = ptsUs * 90L
-        val dts90 = dtsUs?.let { it * 90L }
-        val flags = if (dts90 != null) 0xC0 else 0x80
-        val headerDataLen = if (dts90 != null) 10 else 5
-        val pesLen = 0
+    // ❌ NÃO use "* 90"
+    // ✅ Converta µs -> 90kHz corretamente
+    fun usTo90k(us: Long) = (us * 9L) / 100L
 
-        val baos = ByteArrayOutputStream()
-        fun w(v: Int) = baos.write(v and 0xFF)
-        w(0x00); w(0x00); w(0x01)
-        w(streamId)
-        w((pesLen shr 8) and 0xFF); w(pesLen and 0xFF)
-        w(0x80); w(flags); w(headerDataLen)
+    val pts90 = usTo90k(ptsUs)                       // <-- alterado
+    val dts90 = dtsUs?.let { usTo90k(it) }           // <-- alterado
+    val flags = if (dts90 != null) 0xC0 else 0x80
+    val headerDataLen = if (dts90 != null) 10 else 5
+    val pesLen = 0
 
-        fun stamp(marker: Int, v: Long) {
-            val a = (marker shl 4) or (((v shr 30) and 0x07).toInt() shl 1) or 1
-            val b = (((v shr 15) and 0x7FFF).toInt() shl 1) or 1
-            val c = (((v and 0x7FFF).toInt() shl 1) or 1)
-            w(a); w((b shr 8) and 0xFF); w(b and 0xFF); w((c shr 8) and 0xFF); w(c and 0xFF)
-        }
-        stamp(0x2, pts90)
-        if (dts90 != null) stamp(0x1, dts90)
-        return baos.toByteArray()
+    val baos = java.io.ByteArrayOutputStream()
+    fun w(v: Int) = baos.write(v and 0xFF)
+    w(0x00); w(0x00); w(0x01)
+    w(streamId)
+    w((pesLen shr 8) and 0xFF); w(pesLen and 0xFF)
+    w(0x80); w(flags); w(headerDataLen)
+
+    fun stamp(marker: Int, v: Long) {
+        val a = (marker shl 4) or (((v shr 30) and 0x07).toInt() shl 1) or 1
+        val b = (((v shr 15) and 0x7FFF).toInt() shl 1) or 1
+        val c = (((v and 0x7FFF).toInt() shl 1) or 1)
+        w(a); w((b shr 8) and 0xFF); w(b and 0xFF); w((c shr 8) and 0xFF); w(c and 0xFF)
     }
+    stamp(0x2, pts90)
+    if (dts90 != null) stamp(0x1, dts90)
+    return baos.toByteArray()
+}
+
 
     private fun splitToTs(pid: Int, pcrBase90k: Long?, data: ByteArray, off0: Int, len0: Int, pusi: Boolean) {
         var off = off0
