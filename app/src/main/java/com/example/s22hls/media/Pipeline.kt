@@ -263,17 +263,21 @@ class Pipeline(
 
     var segOpen = false
     var segStartPtsUs: Long = 0L
-    var lastWrittenPtsUs: Long = 0L
+    var baseUs: Long = 0L
+    var lastVideoPtsUsAdj: Long = 0L
+    var lastAudioPtsUsAdj: Long = 0L
 
     fun currentDurSec(): Double =
-        if (!segOpen) 0.0 else ((lastWrittenPtsUs - segStartPtsUs).coerceAtLeast(0L) / 1_000_000.0)
+        if (!segOpen) 0.0 else ((maxOf(lastVideoPtsUsAdj, lastAudioPtsUsAdj)) / 1_000_000.0)
 
     fun openNewSegment(startPtsUs: Long) {
         baos = ByteArrayOutputStream()
         ts = TsWriter(baos)
-        ts.writePatPmt() // sempre começar .ts com PAT/PMT
+        ts.writePatPmt()
         segStartPtsUs = startPtsUs
-        lastWrittenPtsUs = startPtsUs
+        baseUs = startPtsUs
+        lastVideoPtsUsAdj = 0L
+        lastAudioPtsUsAdj = 0L
         segOpen = true
     }
 
@@ -291,58 +295,60 @@ class Pipeline(
         putFile("live.m3u8", m3u8.toByteArray(Charsets.UTF_8))
         mediaSeq += 1
 
-        // prepara para próximo
         segOpen = false
     }
 
     while (running) {
         var wroteSomething = false
 
-        // 1) VIDEO: consome tudo que tiver na fila
+        // VÍDEO
         synchronized(videoQueue) {
             while (videoQueue.isNotEmpty()) {
                 val e = videoQueue.removeFirst()
                 val isKey = (e.flags == 1)
 
                 if (!segOpen) {
-                    // aguardamos um keyframe para abrir o 1º segmento
                     if (!isKey) continue
                     openNewSegment(e.ptsUs)
-                    // cai para gravar este keyframe no novo segmento
                 } else {
-                    // se já atingimos a duração alvo e chegou um NOVO keyframe,
-                    // fechamos o segmento atual ANTES de gravar esse keyframe
+                    // fecha no próximo keyframe quando já atingiu a duração alvo
                     if (isKey && currentDurSec() >= targetDurSec) {
                         closeAndUploadSegment()
                         openNewSegment(e.ptsUs)
                     }
                 }
 
-                ts.writeVideoAccessUnit(e.data, isKey, e.ptsUs, e.dtsUs, vpsSpsPps)
-                lastWrittenPtsUs = e.ptsUs
+                // normaliza PTS/DTS do segmento
+                var ptsAdj = (e.ptsUs - baseUs).coerceAtLeast(0L)
+                var dtsAdj = (e.dtsUs - baseUs).coerceAtLeast(0L)
+                // garante monotonicidade (sem B-frames, DTS==PTS)
+                if (ptsAdj <= lastVideoPtsUsAdj) ptsAdj = lastVideoPtsUsAdj + 1
+                if (dtsAdj > ptsAdj) dtsAdj = ptsAdj
+                lastVideoPtsUsAdj = ptsAdj
+
+                ts.writeVideoAccessUnit(e.data, isKey, ptsAdj, dtsAdj, vpsSpsPps)
                 wroteSomething = true
             }
         }
 
-        // 2) AUDIO: só gravamos se o segmento estiver aberto
+        // ÁUDIO (só grava se houver segmento aberto)
         synchronized(audioQueue) {
             while (segOpen && audioQueue.isNotEmpty()) {
                 val e = audioQueue.removeFirst()
-                // evite áudio muito antes do vídeo: segura se o segmento ainda não tem base PTS válida
-                if (e.ptsUs < segStartPtsUs - 500_000) {
-                    continue
-                }
-                ts.writeAudioFrame(e.data, e.ptsUs, 48000, 2)
-                if (e.ptsUs > lastWrittenPtsUs) lastWrittenPtsUs = e.ptsUs
+                // ignora áudio muito antes do keyframe base
+                if (e.ptsUs < baseUs - 500_000) continue
+
+                var ptsAdj = (e.ptsUs - baseUs).coerceAtLeast(0L)
+                if (ptsAdj <= lastAudioPtsUsAdj) ptsAdj = lastAudioPtsUsAdj + 1
+                lastAudioPtsUsAdj = ptsAdj
+
+                ts.writeAudioFrame(e.data, ptsAdj, 48000, 2)
                 wroteSomething = true
             }
-            // se não há segmento aberto, descarte áudio acumulado (opcional: poderia limitar tamanho)
             if (!segOpen) audioQueue.clear()
         }
 
-        // 3) Fechamento por tempo (fallback): se abrir e não chegar keyframe logo,
-        // não fechamos sem keyframe; o fechamento real acontece quando chegar o keyframe seguinte.
-        // Aqui só deixamos um teto (ex.: 10s) para evitar vazamento de memória.
+        // fallback de segurança (não fecha sem keyframe; só evita vazamento)
         if (segOpen && currentDurSec() > 10.0) {
             closeAndUploadSegment()
         }
@@ -350,11 +356,9 @@ class Pipeline(
         if (!wroteSomething) delay(10)
     }
 
-    // flush final
-    if (segOpen) {
-        closeAndUploadSegment()
-    }
+    if (segOpen) closeAndUploadSegment()
 }
+
 
 
     private fun putFile(name: String, bytes: ByteArray) {
