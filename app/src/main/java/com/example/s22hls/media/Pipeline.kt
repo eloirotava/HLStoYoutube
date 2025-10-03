@@ -36,7 +36,6 @@ class Pipeline(
     private var audioCodec: MediaCodec? = null
     private var audioRec: AudioRecord? = null
 
-    // Thread/Looper para Camera2
     private var camThread: HandlerThread? = null
     private var camHandler: Handler? = null
 
@@ -44,12 +43,8 @@ class Pipeline(
 
     private val workDir = File(ctx.cacheDir, "hls-uploader").apply { mkdirs() }
     private var segIndex = 0
-    private val playlist = HlsPlaylist(
-        targetDurationSec = 3,
-        maxSegments = 6,
-        addIndependentSegmentsTag = true,
-        playlistTypeEvent = false
-    )
+    private var mediaSeq = 0
+    private val playlist = HlsPlaylist(3, 6)
 
     private var vpsSpsPps: ByteArray? = null
 
@@ -57,28 +52,25 @@ class Pipeline(
         running = true
         Log.i(TAG, "Started uploader pipeline")
 
-        // Handler thread para callbacks da Camera2
         camThread = HandlerThread("Camera2Thread").apply { start() }
         camHandler = Handler(camThread!!.looper)
 
-        scope.launch {
-            openCameraAndStart()
-        }
+        scope.launch { openCameraAndStart() }
     }
 
     fun stop() {
         running = false
-        try { session?.close() } catch(_:Throwable){}
-        try { camDevice?.close() } catch(_:Throwable){}
-        try { videoCodec?.stop(); videoCodec?.release() } catch(_:Throwable){}
-        try { audioCodec?.stop(); audioCodec?.release() } catch(_:Throwable){}
-        try { audioRec?.stop(); audioRec?.release() } catch(_:Throwable){}
+        try { session?.close() } catch (_: Throwable) {}
+        try { camDevice?.close() } catch (_: Throwable) {}
+        try { videoCodec?.stop(); videoCodec?.release() } catch (_: Throwable) {}
+        try { audioCodec?.stop(); audioCodec?.release() } catch (_: Throwable) {}
+        try { audioRec?.stop(); audioRec?.release() } catch (_: Throwable) {}
         scope.cancel()
 
         try {
             camThread?.quitSafely()
             camThread?.join()
-        } catch (_:Throwable) {}
+        } catch (_: Throwable) {}
         camHandler = null
         camThread = null
     }
@@ -88,23 +80,15 @@ class Pipeline(
         val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val cam = cm.cameraIdList.getOrNull(cameraId) ?: cm.cameraIdList.first()
 
-        val w = when (resolution) {
-            "1080p" -> 1920
-            "360p"  -> 640
-            else    -> 1280
-        }
-        val h = when (resolution) {
-            "1080p" -> 1080
-            "360p"  -> 360
-            else    -> 720
-        }
+        val w = when (resolution) { "1080p" -> 1920; "360p" -> 640; else -> 1280 }
+        val h = when (resolution) { "1080p" -> 1080; "360p" -> 360; else -> 720 }
 
-        // Encoder de vídeo (HEVC)
+        // Video HEVC
         val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_HEVC, w, h).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, videoBitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, 30)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2) // IDR a cada ~2s
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain)
         }
         val vCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_HEVC).also {
@@ -113,7 +97,7 @@ class Pipeline(
         videoCodec = vCodec
         val inputSurface = vCodec.createInputSurface()
 
-        // Encoder de áudio (AAC LC 48kHz estéreo)
+        // Audio AAC LC 48kHz estéreo
         val sr = 48000
         val ch = 2
         val aFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sr, ch).apply {
@@ -125,7 +109,7 @@ class Pipeline(
         }
         audioCodec = aCodec
 
-        // AudioRecord (PCM 16-bit)
+        // AudioRecord
         val minBuf = AudioRecord.getMinBufferSize(sr, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT)
         val rec = AudioRecord.Builder()
             .setAudioSource(MediaRecorder.AudioSource.CAMCORDER)
@@ -140,22 +124,21 @@ class Pipeline(
             .build()
         audioRec = rec
 
-        // Abre a câmera
+        // Abrir câmera
         val open = CompletableDeferred<Unit>()
         cm.openCamera(cam, object : CameraDevice.StateCallback() {
             override fun onOpened(device: CameraDevice) {
-                Log.i(TAG, "Camera onOpened id=${device.id}")
                 camDevice = device
                 open.complete(Unit)
             }
-            override fun onDisconnected(device: CameraDevice) { }
+            override fun onDisconnected(device: CameraDevice) {}
             override fun onError(device: CameraDevice, error: Int) {
                 open.completeExceptionally(RuntimeException("cam error $error"))
             }
         }, camHandler)
         open.await()
 
-        // Inicia codecs e captura de áudio
+        // Start codecs e captação
         vCodec.start()
         aCodec.start()
         rec.startRecording()
@@ -171,7 +154,6 @@ class Pipeline(
                     set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(30, 30))
                 }
                 s.setRepeatingRequest(req.build(), null, camHandler)
-                Log.i(TAG, "CaptureSession configured")
                 sessionReady.complete(Unit)
             }
             override fun onConfigureFailed(session: CameraCaptureSession) {
@@ -203,7 +185,7 @@ class Pipeline(
                 val isConfig = (bufInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
                 if (isConfig) {
                     vpsSpsPps = data
-                    Log.i(TAG, "Video format changed; got VPS/SPS/PPS (${data.size} bytes)")
+                    Log.i(TAG, "got VPS/SPS/PPS ${data.size}B")
                 } else {
                     val isKey = (bufInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
                     synchronized(videoQueue) {
@@ -259,92 +241,102 @@ class Pipeline(
     }
 
     private suspend fun rotationAndUploadLoop() = withContext(Dispatchers.Default) {
-        val targetDurSec = 2.5 // ~2.5s, TARGETDURATION=3
+        val targetDurSec = 3.0
 
         var baos = ByteArrayOutputStream()
         var ts = TsWriter(baos)
 
         var segOpen = false
-        var segStartPtsUs: Long = 0L
-        var baseUs: Long = 0L
-        var lastVideoPtsUsAdj: Long = 0L
-        var lastAudioPtsUsAdj: Long = 0L
+        var segFirstPtsUsAdj: Long = 0L
+        var segLastPtsUsAdj: Long = 0L
 
-        fun currentDurSec(): Double =
-            if (!segOpen) 0.0 else ((maxOf(lastVideoPtsUsAdj, lastAudioPtsUsAdj)) / 1_000_000.0)
+        // base global de tempo (não zera por segmento)
+        var globalBaseUs: Long = -1L
 
-        fun openNewSegment(startPtsUs: Long) {
+        fun openNewSegment() {
             baos = ByteArrayOutputStream()
             ts = TsWriter(baos)
             ts.writePatPmt()
-            segStartPtsUs = startPtsUs
-            baseUs = startPtsUs
-            lastVideoPtsUsAdj = 0L
-            lastAudioPtsUsAdj = 0L
             segOpen = true
+            segFirstPtsUsAdj = -1L
+            segLastPtsUsAdj = -1L
+        }
+
+        fun currentSegDurSec(): Double {
+            return if (!segOpen || segFirstPtsUsAdj < 0 || segLastPtsUsAdj < 0) 0.0
+            else (segLastPtsUsAdj - segFirstPtsUsAdj).coerceAtLeast(0L) / 1_000_000.0
         }
 
         fun closeAndUploadSegment() {
             if (!segOpen) return
-            val segName = "seg_%05d.ts".format(segIndex)
+            val segName = "seg_%05d.ts".format(segIndex++)
             val segBytes = baos.toByteArray()
+
+            // grava local e envia
             val f = File(workDir, segName)
             FileOutputStream(f).use { it.write(segBytes) }
             putFile(segName, segBytes)
 
-            val dur = currentDurSec().coerceAtLeast(0.1)
-            // MEDIA-SEQUENCE = índice do primeiro segmento da janela (a lib calcula)
-            playlist.add(segIndex, segName, dur)
-            val m3u8 = playlist.toText()
+            val dur = currentSegDurSec().coerceAtLeast(0.1)
+            playlist.add(segName, dur)
+            val m3u8 = playlist.toText(mediaSeq)
             putFile("live.m3u8", m3u8.toByteArray(Charsets.UTF_8))
+            mediaSeq += 1
 
-            segIndex += 1
             segOpen = false
         }
 
         while (running) {
             var wroteSomething = false
 
-            // VÍDEO
+            // Vídeo
             synchronized(videoQueue) {
                 while (videoQueue.isNotEmpty()) {
                     val e = videoQueue.removeFirst()
                     val isKey = (e.flags == 1)
 
+                    if (globalBaseUs < 0 && isKey) {
+                        globalBaseUs = e.ptsUs
+                    }
+                    if (globalBaseUs < 0) continue
+
                     if (!segOpen) {
-                        if (!isKey) continue // abre somente em IDR
-                        openNewSegment(e.ptsUs)
+                        if (!isKey) continue
+                        openNewSegment()
                     } else {
-                        // fecha no próximo keyframe quando já atingiu a duração alvo
-                        if (isKey && currentDurSec() >= targetDurSec) {
+                        if (isKey && currentSegDurSec() >= targetDurSec) {
                             closeAndUploadSegment()
-                            openNewSegment(e.ptsUs)
+                            openNewSegment()
                         }
                     }
 
-                    // normaliza PTS/DTS do segmento
-                    var ptsAdj = (e.ptsUs - baseUs).coerceAtLeast(0L)
-                    var dtsAdj = (e.dtsUs - baseUs).coerceAtLeast(0L)
-                    // sem B-frames: DTS <= PTS
-                    if (ptsAdj <= lastVideoPtsUsAdj) ptsAdj = lastVideoPtsUsAdj + 1
+                    var ptsAdj = (e.ptsUs - globalBaseUs).coerceAtLeast(0L)
+                    var dtsAdj = (e.dtsUs - globalBaseUs).coerceAtLeast(0L)
                     if (dtsAdj > ptsAdj) dtsAdj = ptsAdj
-                    lastVideoPtsUsAdj = ptsAdj
+                    if (segLastPtsUsAdj >= 0 && ptsAdj <= segLastPtsUsAdj) {
+                        ptsAdj = segLastPtsUsAdj + 1
+                        dtsAdj = ptsAdj
+                    }
+                    if (segFirstPtsUsAdj < 0) segFirstPtsUsAdj = ptsAdj
+                    segLastPtsUsAdj = ptsAdj
 
                     ts.writeVideoAccessUnit(e.data, isKey, ptsAdj, dtsAdj, vpsSpsPps)
                     wroteSomething = true
                 }
             }
 
-            // ÁUDIO (só grava se houver segmento aberto)
+            // Áudio
             synchronized(audioQueue) {
                 while (segOpen && audioQueue.isNotEmpty()) {
                     val e = audioQueue.removeFirst()
-                    // ignora áudio muito antes do keyframe base
-                    if (e.ptsUs < baseUs - 500_000) continue
-
-                    var ptsAdj = (e.ptsUs - baseUs).coerceAtLeast(0L)
-                    if (ptsAdj <= lastAudioPtsUsAdj) ptsAdj = lastAudioPtsUsAdj + 1
-                    lastAudioPtsUsAdj = ptsAdj
+                    if (globalBaseUs < 0) continue
+                    var ptsAdj = e.ptsUs - globalBaseUs
+                    if (ptsAdj < 0) continue
+                    if (segLastPtsUsAdj >= 0 && ptsAdj <= segLastPtsUsAdj) {
+                        ptsAdj = segLastPtsUsAdj + 1
+                    }
+                    segLastPtsUsAdj = ptsAdj
+                    if (segFirstPtsUsAdj < 0) segFirstPtsUsAdj = ptsAdj
 
                     ts.writeAudioFrame(e.data, ptsAdj, 48000, 2)
                     wroteSomething = true
@@ -352,8 +344,7 @@ class Pipeline(
                 if (!segOpen) audioQueue.clear()
             }
 
-            // fallback de segurança
-            if (segOpen && currentDurSec() > 10.0) {
+            if (segOpen && currentSegDurSec() > 8.0) {
                 closeAndUploadSegment()
             }
 
@@ -375,7 +366,7 @@ class Pipeline(
                 .put(bytes.toRequestBody("application/octet-stream".toMediaType()))
                 .build()
             client.newCall(req).execute().use { resp ->
-                Log.i(TAG, "PUT $name -> ${resp.code} ")
+                Log.i(TAG, "PUT $name -> ${resp.code}")
                 if (!resp.isSuccessful && name.endsWith(".m3u8")) {
                     Log.e(TAG, "Playlist upload failed body=${resp.body?.string()}")
                 }

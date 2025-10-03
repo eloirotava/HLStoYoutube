@@ -1,33 +1,32 @@
 package com.example.s22hls.media
 
+import java.util.ArrayDeque
+import java.util.Locale
+
 class HlsPlaylist(
     private val targetDurationSec: Int = 3,
-    private val maxSegments: Int = 6,
-    private val addIndependentSegmentsTag: Boolean = true,
-    private val playlistTypeEvent: Boolean = false
+    private val maxSegments: Int = 6
 ) {
-    private data class Entry(val seq: Int, val name: String, val durSec: Double)
-    private val entries = ArrayDeque<Entry>() // janela deslizante
+    private val entries = ArrayDeque<Pair<String, Double>>() // (filename, duration)
 
-    fun add(seq: Int, name: String, durSec: Double) {
-        entries.addLast(Entry(seq, name, durSec))
+    fun add(name: String, durSec: Double) {
+        entries.addLast(name to durSec)
         while (entries.size > maxSegments) entries.removeFirst()
     }
 
-    fun toText(): String {
+    /** Gera o m3u8 com media sequence passado por quem chama */
+    fun toText(mediaSeqStart: Int): String {
         val sb = StringBuilder()
-        sb.appendLine("#EXTM3U")
-        sb.appendLine("#EXT-X-VERSION:3")
-        if (addIndependentSegmentsTag) sb.appendLine("#EXT-X-INDEPENDENT-SEGMENTS")
-        sb.appendLine("#EXT-X-TARGETDURATION:$targetDurationSec")
-        if (playlistTypeEvent) sb.appendLine("#EXT-X-PLAYLIST-TYPE:EVENT")
-
-        val mediaSeq = entries.firstOrNull()?.seq ?: 0
-        sb.appendLine("#EXT-X-MEDIA-SEQUENCE:$mediaSeq")
-
-        for (e in entries) {
-            sb.appendLine("#EXTINF:${"%.3f".format(e.durSec)},")
-            sb.appendLine(e.name)
+        sb.append("#EXTM3U\n")
+        sb.append("#EXT-X-VERSION:3\n")
+        sb.append("#EXT-X-INDEPENDENT-SEGMENTS\n")
+        sb.append("#EXT-X-TARGETDURATION:").append(targetDurationSec).append('\n')
+        sb.append("#EXT-X-MEDIA-SEQUENCE:").append(mediaSeqStart).append('\n')
+        for ((name, dur) in entries) {
+            sb.append("#EXTINF:")
+                .append(String.format(Locale.US, "%.3f", dur))
+                .append(",\n")
+            sb.append(name).append('\n')
         }
         return sb.toString()
     }
