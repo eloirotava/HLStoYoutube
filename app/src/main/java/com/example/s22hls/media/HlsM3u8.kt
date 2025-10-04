@@ -4,7 +4,7 @@ import java.util.ArrayDeque
 import java.util.Locale
 
 class HlsPlaylist(
-    private val targetDurationSec: Int = 3,
+    private val targetDurationSec: Int = 6,
     private val maxSegments: Int = 6
 ) {
     private val entries = ArrayDeque<Pair<String, Double>>() // (filename, duration)
@@ -19,7 +19,7 @@ class HlsPlaylist(
         val sb = StringBuilder()
         sb.append("#EXTM3U\n")
         sb.append("#EXT-X-VERSION:3\n")
-        sb.append("#EXT-X-INDEPENDENT-SEGMENTS\n")
+        //sb.append("#EXT-X-INDEPENDENT-SEGMENTS\n")
         sb.append("#EXT-X-TARGETDURATION:").append(targetDurationSec).append('\n')
         sb.append("#EXT-X-MEDIA-SEQUENCE:").append(mediaSeqStart).append('\n')
         for ((name, dur) in entries) {
