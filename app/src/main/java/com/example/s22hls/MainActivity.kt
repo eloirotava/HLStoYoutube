@@ -1,71 +1,71 @@
-package com.example.s22hls
+package com.example.s22hls.media
 
 import android.Manifest
-import android.content.Intent
-import android.content.pm.PackageManager
 import android.os.Bundle
-import android.widget.*
+import android.view.SurfaceView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
+import com.pedro.rtplibrary.view.OpenGlView
+import com.pedro.rtplibrary.rtsp.server.RtspServerFromCamera2
+import com.pedro.rtsp.utils.ConnectCheckerRtsp
+import com.pedro.rtsp.rtsp.Protocol
+import com.pedro.encoder.input.video.Camera2ApiManager
+import com.pedro.encoder.video.VideoEncoder
+import com.pedro.encoder.audio.AudioEncoder
 
-class MainActivity : AppCompatActivity() {
+class RtspServerActivity : AppCompatActivity(), ConnectCheckerRtsp {
 
-    private lateinit var etUrl: EditText
-    private lateinit var etCameraId: EditText
-    private lateinit var etRes: EditText
-    private lateinit var etBitrate: EditText
-    private lateinit var etAudioK: EditText
-    private lateinit var tvStatus: TextView
+  private lateinit var openGlView: OpenGlView
+  private lateinit var rtspServer: RtspServerFromCamera2
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+  override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    openGlView = OpenGlView(this) // ou SurfaceView(this)
+    setContentView(openGlView)
 
-        etUrl = findViewById(R.id.etUrl)
-        etCameraId = findViewById(R.id.etCameraId)
-        etRes = findViewById(R.id.etRes)
-        etBitrate = findViewById(R.id.etBitrate)
-        etAudioK = findViewById(R.id.etAudioK)
-        tvStatus = findViewById(R.id.tvStatus)
+    ActivityCompat.requestPermissions(
+      this,
+      arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO),
+      123
+    )
 
-        findViewById<Button>(R.id.btnStart).setOnClickListener {
-            if (!hasPermissions()) {
-                ActivityCompat.requestPermissions(
-                    this,
-                    arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO),
-                    100
-                )
-                return@setOnClickListener
-            }
-            startStreaming()
-        }
-        findViewById<Button>(R.id.btnStop).setOnClickListener {
-            stopService(Intent(this, StreamingService::class.java))
-            tvStatus.text = "Parado"
-        }
-    }
+    rtspServer = RtspServerFromCamera2(openGlView, this, 8554)
+    // Vídeo
+    val width = 1280
+    val height = 720
+    val fps = 30
+    val gopSeconds = 3
+    val videoBitrate = 800_000 // alvo para VÍDEO (o total com áudio ≈ 900–950 kb/s)
 
-    private fun hasPermissions(): Boolean {
-        return (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-                && ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
-    }
+    // H.265:
+    rtspServer.setVideoCodec(VideoEncoder.H265)
+    // (se quiser H.264: rtspServer.setVideoCodec(VideoEncoder.H264))
 
-    private fun startStreaming() {
-        val url = etUrl.text.toString().trim()
-        val camId = etCameraId.text.toString().ifEmpty { "0" }.toInt()
-        val res = etRes.text.toString().ifEmpty { "720p" }
-        val br = etBitrate.text.toString().ifEmpty { "800000" }.toInt()
-        val ak = etAudioK.text.toString().ifEmpty { "96" }.toInt()
+    rtspServer.setProtocol(Protocol.TCP) // RTSP por TCP (mais estável para ffmpeg puxar)
+    rtspServer.setVideoBitrateOnFly(videoBitrate)
+    rtspServer.prepareVideo(width, height, fps, gopSeconds * fps, false, 0, 0)
 
-        val i = Intent(this, StreamingService::class.java).apply {
-            putExtra("url", url)
-            putExtra("cameraId", camId)
-            putExtra("res", res)
-            putExtra("vBitrate", br)
-            putExtra("aKbps", ak)
-        }
-        ContextCompat.startForegroundService(this, i)
-        tvStatus.text = "Iniciando..."
-    }
+    // Áudio AAC LC 48k estéreo
+    val audioKbps = 96_000
+    rtspServer.prepareAudio(48000, true, audioKbps, true, false)
+
+    // Inicia câmera e servidor
+    rtspServer.startPreview(Camera2ApiManager.Facing.BACK)
+    // caminho será: rtsp://<ip-do-celular>:8554/live
+    rtspServer.startServer() // default path "/live"
+  }
+
+  override fun onDestroy() {
+    super.onDestroy()
+    if (rtspServer.isStreaming) rtspServer.stopServer()
+    rtspServer.stopPreview()
+  }
+
+  // Callbacks RTSP (logs básicos)
+  override fun onConnectionStartedRtsp(rtspUrl: String) {}
+  override fun onConnectionSuccessRtsp() {}
+  override fun onConnectionFailedRtsp(reason: String) {}
+  override fun onDisconnectRtsp() {}
+  override fun onAuthErrorRtsp() {}
+  override fun onAuthSuccessRtsp() {}
 }
