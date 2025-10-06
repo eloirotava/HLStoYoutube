@@ -48,6 +48,9 @@ class Pipeline(
 
     private var vpsSpsPps: ByteArray? = null
 
+    // >>> NOVO: contador contínuo de amostras (frames por canal) para PTS do áudio
+    private var audioSamplesTotal = 0L
+
     fun start() {
         running = true
         Log.i(TAG, "Started uploader pipeline")
@@ -222,8 +225,13 @@ class Pipeline(
                     tmp[p++] = ((v ushr 8) and 0xFF).toByte()
                 }
                 inBuf.put(tmp, 0, p)
-                val tUs = System.nanoTime() / 1000
-                codec.queueInputBuffer(inIndex, 0, p, tUs, 0)
+
+                // >>> ALTERADO: PTS derivado do total de amostras (frames por canal), estável
+                val framesPorCanal = n / 2                  // estéreo
+                val ptsUs = (audioSamplesTotal * 1_000_000L) / 48_000L
+                audioSamplesTotal += framesPorCanal
+
+                codec.queueInputBuffer(inIndex, 0, p, ptsUs, 0)
             }
             var outIndex = codec.dequeueOutputBuffer(encInfo, 0)
             while (outIndex >= 0) {
